@@ -1,5 +1,7 @@
 # FAQProxy
 
+**[Open the FAQProxy documentation →](https://raw.githack.com/timbergeron/faqproxy/main/docs/index.html)**
+
 [![Build](https://github.com/timbergeron/faqproxy/actions/workflows/build.yml/badge.svg)](https://github.com/timbergeron/faqproxy/actions/workflows/build.yml)
 
 FAQProxy is a clean, NetQuake-only recreation of the original FAQProxy idea: put a protocol-aware process between a Quake client and server so routing, recording, inspection, and later extensions can live outside either engine.

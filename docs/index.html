@@ -1,0 +1,1232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="FAQProxy documentation: run a focused NetQuake UDP relay for protocols 15, 666, and 999 on Windows, Linux, or macOS.">
+  <meta name="theme-color" content="#f4f1eb">
+  <meta property="og:title" content="FAQProxy — NetQuake relay, clearly documented">
+  <meta property="og:description" content="Deploy a focused NetQuake UDP relay for protocols 15, 666, and 999.">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%23171713'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-family='monospace' font-size='24' font-weight='700' fill='white'%3EFQ%3C/text%3E%3C/svg%3E">
+  <title>FAQProxy — NetQuake relay, clearly documented</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f4f1eb;
+      --surface: #fffdf8;
+      --surface-strong: #ffffff;
+      --ink: #171713;
+      --muted: #68665f;
+      --line: #d9d4ca;
+      --line-strong: #bbb5aa;
+      --accent: #b53127;
+      --accent-dark: #87231c;
+      --accent-soft: #f6e3df;
+      --success: #2e6c4d;
+      --code: #1d1d1a;
+      --code-ink: #f8f4eb;
+      --shadow: 0 24px 80px rgba(36, 30, 23, 0.08);
+      --radius-lg: 28px;
+      --radius-md: 18px;
+      --radius-sm: 11px;
+      --content: 1120px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 78% 5%, rgba(181, 49, 39, 0.07), transparent 30rem),
+        var(--canvas);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 17px;
+      line-height: 1.65;
+      text-rendering: optimizeLegibility;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a {
+      color: inherit;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 0.2em;
+    }
+
+    a:hover {
+      color: var(--accent);
+    }
+
+    button,
+    a {
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    :focus-visible {
+      outline: 3px solid rgba(181, 49, 39, 0.38);
+      outline-offset: 3px;
+      border-radius: 4px;
+    }
+
+    .skip-link {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 100;
+      padding: 10px 14px;
+      border-radius: 9px;
+      background: var(--ink);
+      color: white;
+      transform: translateY(-160%);
+    }
+
+    .skip-link:focus {
+      transform: translateY(0);
+    }
+
+    .shell {
+      width: min(calc(100% - 40px), var(--content));
+      margin-inline: auto;
+    }
+
+    .site-header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-bottom: 1px solid rgba(187, 181, 170, 0.68);
+      background: rgba(244, 241, 235, 0.98);
+    }
+
+    .nav {
+      min-height: 72px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 11px;
+      font-size: 15px;
+      font-weight: 760;
+      letter-spacing: -0.01em;
+      text-decoration: none;
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 9px;
+      background: var(--ink);
+      color: white;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      letter-spacing: -0.08em;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      font-size: 14px;
+      font-weight: 620;
+    }
+
+    .nav-links a {
+      text-decoration: none;
+    }
+
+    .button {
+      min-height: 46px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      padding: 0 19px;
+      border: 1px solid var(--ink);
+      border-radius: 999px;
+      background: var(--ink);
+      color: white;
+      font-size: 14px;
+      font-weight: 720;
+      line-height: 1;
+      text-decoration: none;
+      transition: transform 150ms ease, background 150ms ease, border-color 150ms ease;
+    }
+
+    .button:hover {
+      background: var(--accent-dark);
+      border-color: var(--accent-dark);
+      color: white;
+      transform: translateY(-1px);
+    }
+
+    .button.secondary {
+      background: transparent;
+      color: var(--ink);
+      border-color: var(--line-strong);
+    }
+
+    .button.secondary:hover {
+      border-color: var(--ink);
+      background: rgba(255, 255, 255, 0.5);
+    }
+
+    .hero {
+      padding: 104px 0 76px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.7fr);
+      align-items: end;
+      gap: 64px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      margin: 0 0 24px;
+      color: var(--accent-dark);
+      font-size: 13px;
+      font-weight: 780;
+      letter-spacing: 0.12em;
+      line-height: 1.2;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      content: "";
+      box-shadow: 0 0 0 5px var(--accent-soft);
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin-top: 0;
+      line-height: 1.05;
+      letter-spacing: -0.045em;
+    }
+
+    h1 {
+      max-width: 790px;
+      margin-bottom: 28px;
+      font-size: clamp(3.2rem, 8vw, 6.7rem);
+      font-weight: 790;
+    }
+
+    h2 {
+      margin-bottom: 20px;
+      font-size: clamp(2.25rem, 5vw, 4rem);
+      font-weight: 760;
+    }
+
+    h3 {
+      margin-bottom: 12px;
+      font-size: 1.35rem;
+      font-weight: 720;
+      letter-spacing: -0.025em;
+    }
+
+    .hero-copy {
+      max-width: 670px;
+      margin: 0;
+      color: var(--muted);
+      font-size: clamp(1.15rem, 2vw, 1.43rem);
+      line-height: 1.55;
+      letter-spacing: -0.015em;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 35px;
+    }
+
+    .hero-facts {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .hero-facts li {
+      display: grid;
+      grid-template-columns: 78px 1fr;
+      gap: 18px;
+      padding: 18px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .hero-facts strong {
+      font-size: 13px;
+      font-weight: 780;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .hero-facts span {
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .section {
+      padding: 88px 0;
+      scroll-margin-top: 76px;
+    }
+
+    .section-rule {
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .section-heading {
+      display: grid;
+      grid-template-columns: minmax(0, 0.7fr) minmax(280px, 0.3fr);
+      gap: 60px;
+      align-items: end;
+      margin-bottom: 46px;
+    }
+
+    .section-heading p {
+      margin: 0 0 6px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .section-kicker {
+      margin-bottom: 14px;
+      color: var(--accent-dark);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    .quick-start {
+      display: grid;
+      grid-template-columns: 0.82fr 1.18fr;
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .quick-copy {
+      min-width: 0;
+      padding: clamp(30px, 5vw, 58px);
+    }
+
+    .quick-copy ol {
+      margin: 30px 0 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: steps;
+    }
+
+    .quick-copy li {
+      position: relative;
+      min-height: 46px;
+      margin-top: 20px;
+      padding: 2px 0 0 56px;
+      color: var(--muted);
+      counter-increment: steps;
+    }
+
+    .quick-copy li::before {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      background: var(--surface-strong);
+      color: var(--ink);
+      content: counter(steps, decimal-leading-zero);
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .code-stack {
+      min-width: 0;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 10px;
+      background: var(--code);
+    }
+
+    .code-block {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--radius-sm);
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .code-label {
+      display: block;
+      padding: 12px 16px 0;
+      color: #aaa69e;
+      font-size: 11px;
+      font-weight: 760;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    pre {
+      margin: 0;
+      padding: 16px 64px 18px 16px;
+      overflow-x: auto;
+      color: var(--code-ink);
+      font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      line-height: 1.75;
+      tab-size: 2;
+    }
+
+    code {
+      font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    :not(pre) > code {
+      padding: 0.15em 0.38em;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: rgba(255, 255, 255, 0.48);
+      font-size: 0.86em;
+    }
+
+    .copy-button {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      min-width: 54px;
+      min-height: 32px;
+      padding: 0 10px;
+      border: 1px solid rgba(255, 255, 255, 0.17);
+      border-radius: 7px;
+      background: rgba(255, 255, 255, 0.08);
+      color: #d9d5cd;
+      cursor: pointer;
+      font: inherit;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .copy-button:hover {
+      background: rgba(255, 255, 255, 0.15);
+      color: white;
+    }
+
+    .routing {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: stretch;
+      gap: 14px;
+    }
+
+    .route-node {
+      min-height: 190px;
+      padding: 26px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+    }
+
+    .route-node.proxy {
+      border-color: rgba(181, 49, 39, 0.45);
+      background: linear-gradient(145deg, #fff9f5, var(--accent-soft));
+    }
+
+    .route-node small {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .route-node strong {
+      display: block;
+      margin: 12px 0 6px;
+      font-size: 22px;
+      letter-spacing: -0.03em;
+    }
+
+    .route-node span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .route-arrow {
+      width: 42px;
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      font-size: 24px;
+    }
+
+    .clarity-note {
+      margin-top: 24px;
+      padding: 22px 24px;
+      border-left: 3px solid var(--accent);
+      border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+      background: rgba(255, 255, 255, 0.42);
+      color: var(--muted);
+    }
+
+    .clarity-note strong {
+      color: var(--ink);
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+
+    th,
+    td {
+      padding: 19px 22px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+    }
+
+    td {
+      font-size: 15px;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--success);
+      font-size: 13px;
+      font-weight: 740;
+      white-space: nowrap;
+    }
+
+    .status::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      content: "";
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .card {
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+    }
+
+    .card-number {
+      display: block;
+      margin-bottom: 46px;
+      color: var(--accent-dark);
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .reference-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(300px, 0.72fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .option-list {
+      margin: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+    }
+
+    .option-row {
+      display: grid;
+      grid-template-columns: 190px 1fr;
+      gap: 22px;
+      padding: 20px 22px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .option-row:last-child {
+      border-bottom: 0;
+    }
+
+    .option-row dt {
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .option-row dd {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .side-panel {
+      padding: 30px;
+      border-radius: var(--radius-md);
+      background: var(--ink);
+      color: white;
+    }
+
+    .side-panel h3 {
+      margin-bottom: 18px;
+    }
+
+    .side-panel p,
+    .side-panel li {
+      color: #c7c3ba;
+      font-size: 14px;
+    }
+
+    .side-panel ul {
+      margin: 20px 0 0;
+      padding-left: 20px;
+    }
+
+    .side-panel li + li {
+      margin-top: 10px;
+    }
+
+    .security {
+      display: grid;
+      grid-template-columns: minmax(0, 0.72fr) minmax(340px, 1.28fr);
+      gap: 64px;
+      padding: clamp(34px, 6vw, 70px);
+      border-radius: var(--radius-lg);
+      background: var(--ink);
+      color: white;
+    }
+
+    .security .section-kicker {
+      color: #ec8b80;
+    }
+
+    .security p {
+      margin: 0;
+      color: #c7c3ba;
+    }
+
+    .security-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .security-list li {
+      padding: 18px 0 18px 40px;
+      border-top: 1px solid rgba(255, 255, 255, 0.13);
+      background: radial-gradient(circle at 10px 31px, #ec8b80 0 3px, transparent 4px);
+      color: #e2ded6;
+    }
+
+    .security-list li:last-child {
+      border-bottom: 1px solid rgba(255, 255, 255, 0.13);
+    }
+
+    .history {
+      display: grid;
+      grid-template-columns: 0.62fr 1.38fr;
+      gap: 70px;
+      align-items: start;
+    }
+
+    .history blockquote {
+      margin: 0;
+      font-size: clamp(1.5rem, 3vw, 2.3rem);
+      font-weight: 680;
+      line-height: 1.3;
+      letter-spacing: -0.035em;
+    }
+
+    .history-copy p {
+      margin-top: 0;
+      color: var(--muted);
+    }
+
+    .history-copy p + p {
+      margin-top: 18px;
+    }
+
+    .site-footer {
+      padding: 44px 0 56px;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .footer-grid {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 30px;
+    }
+
+    .footer-grid p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .footer-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    @media (max-width: 900px) {
+      .hero-grid,
+      .section-heading,
+      .quick-start,
+      .reference-grid,
+      .security,
+      .history {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        padding-top: 76px;
+      }
+
+      .hero-grid,
+      .section-heading,
+      .security,
+      .history {
+        gap: 38px;
+      }
+
+      .hero-facts {
+        max-width: 560px;
+      }
+
+      .routing {
+        grid-template-columns: 1fr;
+      }
+
+      .route-arrow {
+        width: auto;
+        height: 32px;
+        transform: rotate(90deg);
+      }
+
+      .route-node {
+        min-height: 150px;
+      }
+
+      .cards {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .security {
+        padding: 42px;
+      }
+    }
+
+    @media (max-width: 650px) {
+      body {
+        font-size: 16px;
+      }
+
+      .shell {
+        width: min(calc(100% - 28px), var(--content));
+      }
+
+      .nav {
+        min-height: 64px;
+      }
+
+      .nav-links > a:not(.button) {
+        display: none;
+      }
+
+      .nav-links {
+        gap: 10px;
+      }
+
+      .nav-links .button {
+        min-height: 40px;
+        padding-inline: 15px;
+      }
+
+      .hero {
+        padding: 60px 0 54px;
+      }
+
+      h1 {
+        font-size: clamp(3rem, 16vw, 4.5rem);
+      }
+
+      .section {
+        padding: 66px 0;
+      }
+
+      .quick-copy,
+      .card,
+      .side-panel {
+        padding: 25px;
+      }
+
+      .cards {
+        grid-template-columns: 1fr;
+      }
+
+      .card-number {
+        margin-bottom: 28px;
+      }
+
+      .option-row {
+        grid-template-columns: 1fr;
+        gap: 7px;
+      }
+
+      .security {
+        padding: 30px 24px;
+      }
+
+      .footer-grid {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        transition-duration: 0.01ms !important;
+      }
+    }
+
+    @media print {
+      .site-header,
+      .hero-actions,
+      .copy-button {
+        display: none;
+      }
+
+      body {
+        background: white;
+      }
+
+      .section {
+        padding: 36px 0;
+      }
+
+      .quick-start,
+      .security {
+        break-inside: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to documentation</a>
+
+  <header class="site-header">
+    <nav class="nav shell" aria-label="Primary navigation">
+      <a class="brand" href="#top" aria-label="FAQProxy documentation home">
+        <span class="brand-mark" aria-hidden="true">FQ</span>
+        <span>FAQProxy</span>
+      </a>
+      <div class="nav-links">
+        <a href="#quick-start">Quick start</a>
+        <a href="#deployment">Deploy</a>
+        <a href="#reference">Reference</a>
+        <a class="button" href="https://github.com/timbergeron/faqproxy">View on GitHub <span aria-hidden="true">↗</span></a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="content">
+    <section class="hero" id="top">
+      <div class="hero-grid shell">
+        <div>
+          <p class="eyebrow">NetQuake, routed with intent</p>
+          <h1>One small proxy. Nothing hidden.</h1>
+          <p class="hero-copy">Run FAQProxy on a VPS, point it at one NetQuake server, and connect your client to the proxy. Native protocol 15, 666, and 999 packets remain byte-for-byte intact.</p>
+          <div class="hero-actions">
+            <a class="button" href="#quick-start">Start in two minutes <span aria-hidden="true">↓</span></a>
+            <a class="button secondary" href="https://github.com/timbergeron/faqproxy/actions/workflows/build.yml">Download a build</a>
+          </div>
+        </div>
+        <ul class="hero-facts" aria-label="Project facts">
+          <li><strong>Clients</strong><span>JoeQuake, Quakespasm-family, QSS-M</span></li>
+          <li><strong>Wire</strong><span>NetQuake UDP control protocol 3</span></li>
+          <li><strong>Builds</strong><span>Windows x86-64, Linux, macOS</span></li>
+          <li><strong>License</strong><span>MIT, independent implementation</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section section-rule" id="quick-start">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Quick start</p>
+            <h2>From source to server.</h2>
+          </div>
+          <p>Build locally, start the relay, then use the familiar Quake console. Replace the example hostname with your actual NetQuake server.</p>
+        </div>
+
+        <div class="quick-start">
+          <div class="quick-copy">
+            <h3>The entire path</h3>
+            <ol>
+              <li>Build and run the automated protocol suite.</li>
+              <li>Start FAQProxy with one fixed upstream server.</li>
+              <li>Connect your client to the proxy's address.</li>
+            </ol>
+          </div>
+          <div class="code-stack">
+            <div class="code-block">
+              <span class="code-label">Build</span>
+              <button class="copy-button" type="button" data-copy aria-label="Copy build commands">Copy</button>
+              <pre><code>git clone https://github.com/timbergeron/faqproxy.git
+cd faqproxy
+make test</code></pre>
+            </div>
+            <div class="code-block">
+              <span class="code-label">Run the proxy</span>
+              <button class="copy-button" type="button" data-copy aria-label="Copy proxy command">Copy</button>
+              <pre><code>./build/faqproxy \
+  --listen 0.0.0.0:26000 \
+  quake.example.net:26000</code></pre>
+            </div>
+            <div class="code-block">
+              <span class="code-label">Quake console</span>
+              <button class="copy-button" type="button" data-copy aria-label="Copy client command">Copy</button>
+              <pre><code>connect your.vps.address:26000</code></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-rule" id="architecture">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Architecture</p>
+            <h2>A relay, not a translator.</h2>
+          </div>
+          <p>The connection handshake is redirected to FAQProxy's public UDP port. Once connected, the native game protocol travels unchanged in both directions.</p>
+        </div>
+
+        <div class="routing" aria-label="Traffic travels from a NetQuake client through FAQProxy to a NetQuake server">
+          <div class="route-node">
+            <small>01 · Client</small>
+            <div>
+              <strong>Quake engine</strong>
+              <span>JoeQuake, QS, QSS-M, or another compatible NetQuake client</span>
+            </div>
+          </div>
+          <div class="route-arrow" aria-hidden="true">→</div>
+          <div class="route-node proxy">
+            <small>02 · VPS</small>
+            <div>
+              <strong>FAQProxy</strong>
+              <span>Handshake routing, packet relay, inspection, and optional demo recording</span>
+            </div>
+          </div>
+          <div class="route-arrow" aria-hidden="true">→</div>
+          <div class="route-node">
+            <small>03 · Upstream</small>
+            <div>
+              <strong>NetQuake server</strong>
+              <span>One configured IPv4 server and port per FAQProxy process</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="clarity-note">
+          <strong>Important:</strong> FAQProxy does not make a QuakeWorld server speak NetQuake, and it does not convert protocol 15 clients into protocol 666 or 999 clients. The client and server must already share a native protocol.
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-rule" id="compatibility">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Compatibility</p>
+            <h2>Three protocols. Tested end to end.</h2>
+          </div>
+          <p>The inspector understands each protocol's angle and extension framing while the relay preserves the original payload.</p>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Protocol</th>
+                <th scope="col">Family</th>
+                <th scope="col">Angle handling</th>
+                <th scope="col">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>15</strong></td>
+                <td>NetQuake</td>
+                <td>Native 8-bit, ProQuake 16-bit, and FTE2 prediction framing</td>
+                <td><span class="status">Supported</span></td>
+              </tr>
+              <tr>
+                <td><strong>666</strong></td>
+                <td>FitzQuake</td>
+                <td>16-bit client view angles</td>
+                <td><span class="status">Supported</span></td>
+              </tr>
+              <tr>
+                <td><strong>999</strong></td>
+                <td>RMQ</td>
+                <td>Protocol-flag-selected angle representation, including float angles</td>
+                <td><span class="status">Supported</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-rule" id="deployment">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">VPS deployment</p>
+            <h2>Small footprint. Clear boundaries.</h2>
+          </div>
+          <p>Use a dedicated user, expose only the chosen UDP port, and let the provided service unit contain the process.</p>
+        </div>
+
+        <div class="cards">
+          <article class="card">
+            <span class="card-number">01 / INSTALL</span>
+            <h3>Put it in place</h3>
+            <p>Run <code>sudo make install</code> to place the Unix binary at <code>/usr/local/bin/faqproxy</code>.</p>
+          </article>
+          <article class="card">
+            <span class="card-number">02 / FIREWALL</span>
+            <h3>Open one UDP port</h3>
+            <p>Allow inbound UDP 26000 in the provider and host firewalls. Restrict source networks for private use.</p>
+          </article>
+          <article class="card">
+            <span class="card-number">03 / SERVICE</span>
+            <h3>Run it contained</h3>
+            <p>Adapt <a href="https://github.com/timbergeron/faqproxy/blob/main/docs/faqproxy.service">the hardened systemd unit</a>, validate it, then enable it.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-rule" id="reference">
+      <div class="shell">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Command reference</p>
+            <h2>Only the controls you need.</h2>
+          </div>
+          <p>The final positional argument is always the fixed upstream server. Ports default to the standard NetQuake port, 26000.</p>
+        </div>
+
+        <div class="reference-grid">
+          <dl class="option-list">
+            <div class="option-row">
+              <dt>-l, --listen</dt>
+              <dd>Local IPv4 address and UDP port. Default: <code>0.0.0.0:26000</code>.</dd>
+            </div>
+            <div class="option-row">
+              <dt>-r, --record-dir</dt>
+              <dd>Create one first-person NetQuake <code>.dem</code> recording per accepted connection.</dd>
+            </div>
+            <div class="option-row">
+              <dt>-m, --max-clients</dt>
+              <dd>Concurrent session limit from 1 to 64. Default: 32.</dd>
+            </div>
+            <div class="option-row">
+              <dt>-t, --timeout</dt>
+              <dd>Established-session idle timeout from 0 to 86,400 seconds. Default: 120.</dd>
+            </div>
+            <div class="option-row">
+              <dt>-v, -vv</dt>
+              <dd>Show additional diagnostics, or one line for every forwarded datagram.</dd>
+            </div>
+            <div class="option-row">
+              <dt>--version, --help</dt>
+              <dd>Print the installed version or the complete command-line usage.</dd>
+            </div>
+          </dl>
+
+          <aside class="side-panel" aria-labelledby="recording-title">
+            <p class="section-kicker">Demo recording</p>
+            <h3 id="recording-title">Native playback, preserved.</h3>
+            <p>Recordings retain the server's original 15, 666, or 999 messages and follow the connected player's view.</p>
+            <ul>
+              <li>Existing paths are never overwritten.</li>
+              <li>Unix files use mode <code>0640</code>.</li>
+              <li>Recording failure never stops packet forwarding.</li>
+              <li>Play back in an engine that supports the recorded protocol.</li>
+            </ul>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="security">
+      <div class="shell">
+        <div class="security">
+          <div>
+            <p class="section-kicker">Security model</p>
+            <h2>Know what the protocol cannot promise.</h2>
+            <p>NetQuake predates modern authenticated challenge handshakes. FAQProxy is intentionally transparent about that boundary.</p>
+          </div>
+          <ul class="security-list">
+            <li>There is no authentication, encryption, or cryptographic source validation.</li>
+            <li>A reachable listener can be used to attempt slot exhaustion or UDP reflection.</li>
+            <li>RCON requests can reach the configured upstream server; use a strong password.</li>
+            <li>Use host and provider firewalls when the proxy is not intended to be public.</li>
+            <li>Keep <code>--max-clients</code> bounded and monitor service logs.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-rule" id="history">
+      <div class="history shell">
+        <blockquote>Built in recognition of the tool that showed a proxy could become part of the game.</blockquote>
+        <div class="history-copy">
+          <p>The original FAQProxy was created in 1997 by Juha “Perkele” Kujala and Ilkka “Zibbo” Rajala of the Finnish Allied Quakers clan. It pioneered external demo recording, spectator and chase-camera experiments, teamplay tools, and programmable routing. That work later evolved into Qizmo.</p>
+          <p>This repository is a new, independent implementation. All credit for the original FAQProxy concept and historical implementation belongs to Perkele, Zibbo, and its original contributors.</p>
+          <p><a href="https://github.com/timbergeron/faqproxy#historical-credit">Read the full project notes on GitHub →</a></p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-grid shell">
+      <p>FAQProxy 0.1 · NetQuake only · MIT licensed</p>
+      <div class="footer-links">
+        <a href="https://github.com/timbergeron/faqproxy">Source</a>
+        <a href="https://github.com/timbergeron/faqproxy/actions/workflows/build.yml">Builds</a>
+        <a href="https://github.com/timbergeron/faqproxy/issues">Issues</a>
+        <a href="#top">Back to top ↑</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      "use strict";
+
+      function copyText(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+          return navigator.clipboard.writeText(text);
+        }
+
+        return new Promise(function (resolve, reject) {
+          var field = document.createElement("textarea");
+          field.value = text;
+          field.setAttribute("readonly", "");
+          field.style.position = "fixed";
+          field.style.opacity = "0";
+          document.body.appendChild(field);
+          field.select();
+          try {
+            document.execCommand("copy");
+            resolve();
+          } catch (error) {
+            reject(error);
+          } finally {
+            document.body.removeChild(field);
+          }
+        });
+      }
+
+      document.querySelectorAll("[data-copy]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          var code = button.parentElement.querySelector("code");
+          if (!code) return;
+
+          copyText(code.textContent).then(function () {
+            button.textContent = "Copied";
+            window.setTimeout(function () {
+              button.textContent = "Copy";
+            }, 1600);
+          }).catch(function () {
+            button.textContent = "Select";
+          });
+        });
+      });
+    }());
+  </script>
+</body>
+</html>
