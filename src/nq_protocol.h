@@ -32,6 +32,9 @@
 #define NQ_PRFL_SHORTANGLE (UINT32_C(1) << 1)
 #define NQ_PRFL_FLOATANGLE (UINT32_C(1) << 2)
 
+#define NQ_PEXT2_PRYDONCURSOR UINT32_C(0x00000001)
+#define NQ_PEXT2_PREDINFO UINT32_C(0x00000020)
+
 #define NQ_SVC_SERVERINFO 11
 
 typedef struct nq_packet_view {
@@ -58,6 +61,7 @@ bool nq_accept_port(const uint8_t *data, size_t length, uint16_t *port);
 
 bool nq_supported_protocol(int protocol);
 const char *nq_protocol_name(int protocol);
-int nq_find_server_protocol(const uint8_t *message, size_t length, uint32_t *protocol_flags);
+int nq_find_server_protocol(const uint8_t *message, size_t length, uint32_t *protocol_flags,
+                            uint32_t *pext2_flags);
 
 #endif

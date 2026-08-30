@@ -145,10 +145,12 @@ bool nq_accept_port(const uint8_t *data, size_t length, uint16_t *port)
         view.command != NQ_CCREP_ACCEPT)
         return false;
 
-    if (length < 9) {
+    if (length == 5) {
         *port = 0;
         return true;
     }
+    if (length < 9)
+        return false;
     value = nq_read_le32(data + 5);
     if (value > UINT16_MAX)
         return false;
@@ -176,18 +178,22 @@ const char *nq_protocol_name(int protocol)
     }
 }
 
-int nq_find_server_protocol(const uint8_t *message, size_t length, uint32_t *protocol_flags)
+int nq_find_server_protocol(const uint8_t *message, size_t length, uint32_t *protocol_flags,
+                            uint32_t *pext2_flags)
 {
     size_t i;
 
     if (protocol_flags)
         *protocol_flags = 0;
+    if (pext2_flags)
+        *pext2_flags = 0;
     if (!message)
         return 0;
 
     for (i = 0; i + 5 <= length; ++i) {
         size_t offset;
         uint32_t value;
+        uint32_t candidate_pext2 = 0;
 
         if (message[i] != NQ_SVC_SERVERINFO)
             continue;
@@ -200,7 +206,9 @@ int nq_find_server_protocol(const uint8_t *message, size_t length, uint32_t *pro
             if (value == NQ_PROTOCOL_FTE_PEXT1 || value == NQ_PROTOCOL_FTE_PEXT2) {
                 if (offset + 4 > length)
                     break;
-                offset += 4; /* extension flags */
+                if (value == NQ_PROTOCOL_FTE_PEXT2)
+                    candidate_pext2 = nq_read_le32(message + offset);
+                offset += 4;
                 continue;
             }
             if (!nq_supported_protocol((int)value))
@@ -211,6 +219,8 @@ int nq_find_server_protocol(const uint8_t *message, size_t length, uint32_t *pro
                 if (protocol_flags)
                     *protocol_flags = nq_read_le32(message + offset);
             }
+            if (pext2_flags)
+                *pext2_flags = candidate_pext2;
             return (int)value;
         }
     }

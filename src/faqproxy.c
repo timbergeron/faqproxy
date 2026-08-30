@@ -1,14 +1,12 @@
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "nq_protocol.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <getopt.h>
 #include <limits.h>
-#include <netdb.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -16,11 +14,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <time.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <direct.h>
+#include <io.h>
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define FAQPROXY_VERSION "0.1.0"
 #define FAQPROXY_MAX_SESSIONS 64
@@ -28,8 +43,25 @@
 #define FAQPROXY_MESSAGE_SIZE 65536
 #define FAQPROXY_CONNECT_TIMEOUT_MS UINT64_C(15000)
 #define FAQPROXY_QUERY_TIMEOUT_MS UINT64_C(5000)
+#define FAQPROXY_DUPLICATE_CONNECT_MS UINT64_C(2000)
 #define FAQPROXY_POLL_MS 250
 #define NQ_PQF_IGNOREPORT 0x80
+
+#ifdef _WIN32
+typedef SOCKET proxy_socket;
+typedef int proxy_socklen;
+typedef int proxy_io_size;
+typedef WSAPOLLFD proxy_pollfd;
+typedef ULONG proxy_nfds;
+#define PROXY_INVALID_SOCKET INVALID_SOCKET
+#else
+typedef int proxy_socket;
+typedef socklen_t proxy_socklen;
+typedef ssize_t proxy_io_size;
+typedef struct pollfd proxy_pollfd;
+typedef nfds_t proxy_nfds;
+#define PROXY_INVALID_SOCKET (-1)
+#endif
 
 typedef enum session_state {
     SESSION_FREE = 0,
@@ -43,11 +75,12 @@ typedef struct reassembly {
     size_t length;
     uint32_t last_sequence;
     bool have_sequence;
+    bool discard_until_eom;
 } reassembly;
 
 typedef struct session {
     session_state state;
-    int upstream_fd;
+    proxy_socket upstream_fd;
     unsigned long id;
     struct sockaddr_in client;
     struct sockaddr_in server;
@@ -56,12 +89,14 @@ typedef struct session {
     uint64_t bytes_from_server;
     uint64_t packets_from_client;
     uint64_t packets_from_server;
+    uint64_t accepted_at_ms;
     uint8_t cached_accept[256];
     size_t cached_accept_length;
     bool proquake_requested;
     bool proquake_angles;
     int protocol;
     uint32_t protocol_flags;
+    uint32_t pext2_flags;
     float viewangles[3];
     reassembly server_reliable;
     reassembly client_reliable;
@@ -82,7 +117,7 @@ typedef struct config {
 
 typedef struct app {
     config cfg;
-    int listen_fd;
+    proxy_socket listen_fd;
     uint16_t listen_port;
     unsigned long next_session_id;
     session sessions[FAQPROXY_MAX_SESSIONS];
@@ -90,19 +125,136 @@ typedef struct app {
 
 static volatile sig_atomic_t stop_requested;
 
+#if defined(__GNUC__) || defined(__clang__)
+static void app_log(const app *proxy, int level, const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+#endif
+
+static void shutdown_network(void);
+
+static bool initialize_network(void)
+{
+#ifdef _WIN32
+    WSADATA data;
+    int status = WSAStartup(MAKEWORD(2, 2), &data);
+
+    if (status != 0) {
+        fprintf(stderr, "Cannot initialize Winsock: error %d\n", status);
+        return false;
+    }
+    if (LOBYTE(data.wVersion) != 2 || HIBYTE(data.wVersion) != 2) {
+        fprintf(stderr, "Winsock 2.2 is not available\n");
+        WSACleanup();
+        return false;
+    }
+#endif
+    if (atexit(shutdown_network) != 0) {
+        fprintf(stderr, "Cannot register network cleanup\n");
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return false;
+    }
+    return true;
+}
+
+static void shutdown_network(void)
+{
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+static const char *socket_error_string(void)
+{
+#ifdef _WIN32
+    static char message[256];
+    int error = WSAGetLastError();
+    DWORD length;
+
+    length = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+                            (DWORD)error, 0, message, (DWORD)sizeof(message), NULL);
+    while (length > 0 && (message[length - 1] == '\r' || message[length - 1] == '\n'))
+        message[--length] = 0;
+    if (length == 0)
+        snprintf(message, sizeof(message), "Winsock error %d", error);
+    return message;
+#else
+    return strerror(errno);
+#endif
+}
+
+static bool socket_interrupted(void)
+{
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
+static bool socket_would_block(void)
+{
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+static const char *address_error_string(int status)
+{
+#ifdef _WIN32
+    return gai_strerrorA(status);
+#else
+    return gai_strerror(status);
+#endif
+}
+
+static void close_socket(proxy_socket descriptor)
+{
+#ifdef _WIN32
+    (void)closesocket(descriptor);
+#else
+    (void)close(descriptor);
+#endif
+}
+
 static uint64_t monotonic_milliseconds(void)
 {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
     struct timespec now;
 
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return 0;
     return (uint64_t)now.tv_sec * UINT64_C(1000) + (uint64_t)now.tv_nsec / UINT64_C(1000000);
+#endif
 }
 
 static void handle_signal(int signal_number)
 {
     (void)signal_number;
     stop_requested = 1;
+}
+
+static bool install_signal_handlers(void)
+{
+#ifdef _WIN32
+    return signal(SIGINT, handle_signal) != SIG_ERR && signal(SIGTERM, handle_signal) != SIG_ERR &&
+           signal(SIGBREAK, handle_signal) != SIG_ERR;
+#else
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    sigemptyset(&action.sa_mask);
+    action.sa_handler = handle_signal;
+    if (sigaction(SIGINT, &action, NULL) != 0 || sigaction(SIGTERM, &action, NULL) != 0)
+        return false;
+    action.sa_handler = SIG_IGN;
+    return sigaction(SIGPIPE, &action, NULL) == 0;
+#endif
 }
 
 static void app_log(const app *proxy, int level, const char *format, ...)
@@ -152,7 +304,8 @@ static bool resolve_endpoint(const char *text, const char *default_host, uint16_
                              size_t display_capacity)
 {
     char copy[512];
-    char *host;
+    char *endpoint_host;
+    const char *host;
     char *colon;
     uint16_t port = default_port;
     char service[16];
@@ -164,7 +317,7 @@ static bool resolve_endpoint(const char *text, const char *default_host, uint16_
     if (!text || strlen(text) >= sizeof(copy))
         return false;
     memcpy(copy, text, strlen(text) + 1);
-    host = copy;
+    endpoint_host = copy;
     colon = strrchr(copy, ':');
     if (colon) {
         if (strchr(copy, ':') != colon) {
@@ -177,8 +330,11 @@ static bool resolve_endpoint(const char *text, const char *default_host, uint16_
             return false;
         }
     }
-    if (!*host)
-        host = (char *)default_host;
+    if (!*endpoint_host && !default_host) {
+        fprintf(stderr, "Endpoint is missing a host: %s\n", text);
+        return false;
+    }
+    host = *endpoint_host ? endpoint_host : default_host;
 
     snprintf(service, sizeof(service), "%u", (unsigned int)port);
     memset(&hints, 0, sizeof(hints));
@@ -190,7 +346,7 @@ static bool resolve_endpoint(const char *text, const char *default_host, uint16_
 
     status = getaddrinfo(host, service, &hints, &addresses);
     if (status != 0) {
-        fprintf(stderr, "Could not resolve %s: %s\n", text, gai_strerror(status));
+        fprintf(stderr, "Could not resolve %s: %s\n", text, address_error_string(status));
         return false;
     }
     candidate = addresses;
@@ -207,57 +363,134 @@ static bool resolve_endpoint(const char *text, const char *default_host, uint16_
     return true;
 }
 
-static bool set_nonblocking(int descriptor)
+static bool set_close_on_exec(int descriptor)
 {
-    int flags = fcntl(descriptor, F_GETFL, 0);
+#ifdef _WIN32
+    intptr_t native_handle = _get_osfhandle(descriptor);
 
-    return flags >= 0 && fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0;
+    return native_handle != -1 &&
+           SetHandleInformation((HANDLE)native_handle, HANDLE_FLAG_INHERIT, 0) != 0;
+#else
+    int descriptor_flags = fcntl(descriptor, F_GETFD, 0);
+
+    return descriptor_flags >= 0 && fcntl(descriptor, F_SETFD, descriptor_flags | FD_CLOEXEC) == 0;
+#endif
 }
 
-static int open_listen_socket(const struct sockaddr_in *address, uint16_t *bound_port)
+static bool configure_socket(proxy_socket descriptor)
 {
-    int descriptor;
+#ifdef _WIN32
+    u_long nonblocking = 1;
+
+    return ioctlsocket(descriptor, (long)FIONBIO, &nonblocking) == 0 &&
+           SetHandleInformation((HANDLE)descriptor, HANDLE_FLAG_INHERIT, 0) != 0;
+#else
+    int flags = fcntl(descriptor, F_GETFL, 0);
+
+    if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0)
+        return false;
+    return set_close_on_exec(descriptor);
+#endif
+}
+
+static proxy_socket open_listen_socket(const struct sockaddr_in *address, uint16_t *bound_port)
+{
+    proxy_socket descriptor;
     int enabled = 1;
     struct sockaddr_in actual;
-    socklen_t actual_length = sizeof(actual);
+    proxy_socklen actual_length = (proxy_socklen)sizeof(actual);
 
     descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (descriptor < 0)
-        return -1;
-    (void)setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
-    if (!set_nonblocking(descriptor) ||
-        bind(descriptor, (const struct sockaddr *)address, sizeof(*address)) != 0 ||
+    if (descriptor == PROXY_INVALID_SOCKET)
+        return PROXY_INVALID_SOCKET;
+    (void)setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, (const char *)&enabled,
+                     (proxy_socklen)sizeof(enabled));
+    if (!configure_socket(descriptor) ||
+        bind(descriptor, (const struct sockaddr *)address, (proxy_socklen)sizeof(*address)) != 0 ||
         getsockname(descriptor, (struct sockaddr *)&actual, &actual_length) != 0) {
-        close(descriptor);
-        return -1;
+        close_socket(descriptor);
+        return PROXY_INVALID_SOCKET;
     }
     *bound_port = ntohs(actual.sin_port);
     return descriptor;
 }
 
-static int open_upstream_socket(void)
+static proxy_socket open_upstream_socket(void)
 {
-    int descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    proxy_socket descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
-    if (descriptor < 0)
-        return -1;
-    if (!set_nonblocking(descriptor)) {
-        close(descriptor);
-        return -1;
+    if (descriptor == PROXY_INVALID_SOCKET)
+        return PROXY_INVALID_SOCKET;
+    if (!configure_socket(descriptor)) {
+        close_socket(descriptor);
+        return PROXY_INVALID_SOCKET;
     }
     return descriptor;
 }
 
-static bool send_datagram(int descriptor, const uint8_t *data, size_t length,
+static bool send_datagram(proxy_socket descriptor, const uint8_t *data, size_t length,
                           const struct sockaddr_in *destination)
 {
-    ssize_t sent;
+    proxy_io_size sent;
+
+    if (length > INT_MAX)
+        return false;
 
     do {
+#ifdef _WIN32
+        sent = sendto(descriptor, (const char *)data, (int)length, 0,
+                      (const struct sockaddr *)destination, (proxy_socklen)sizeof(*destination));
+#else
         sent = sendto(descriptor, data, length, 0, (const struct sockaddr *)destination,
-                      sizeof(*destination));
-    } while (sent < 0 && errno == EINTR);
+                      (proxy_socklen)sizeof(*destination));
+#endif
+    } while (sent < 0 && socket_interrupted());
     return sent >= 0 && (size_t)sent == length;
+}
+
+static bool local_time_value(time_t value, struct tm *result)
+{
+#ifdef _WIN32
+    return localtime_s(result, &value) == 0;
+#else
+    return localtime_r(&value, result) != NULL;
+#endif
+}
+
+static int make_directory(const char *path)
+{
+#ifdef _WIN32
+    return _mkdir(path);
+#else
+    return mkdir(path, 0755);
+#endif
+}
+
+static int close_file_descriptor(int descriptor)
+{
+#ifdef _WIN32
+    return _close(descriptor);
+#else
+    return close(descriptor);
+#endif
+}
+
+static FILE *file_descriptor_stream(int descriptor)
+{
+#ifdef _WIN32
+    return _fdopen(descriptor, "wb");
+#else
+    return fdopen(descriptor, "wb");
+#endif
+}
+
+static int delete_file(const char *path)
+{
+#ifdef _WIN32
+    return _unlink(path);
+#else
+    return unlink(path);
+#endif
 }
 
 static bool ensure_record_directory(const char *path)
@@ -266,11 +499,16 @@ static bool ensure_record_directory(const char *path)
 
     if (!*path)
         return true;
-    if (stat(path, &information) == 0)
-        return S_ISDIR(information.st_mode);
+    if (stat(path, &information) == 0) {
+        if (S_ISDIR(information.st_mode)) {
+            return true;
+        }
+        errno = ENOTDIR;
+        return false;
+    }
     if (errno != ENOENT)
         return false;
-    return mkdir(path, 0755) == 0;
+    return make_directory(path) == 0;
 }
 
 static bool demo_write_message(session *connection, const uint8_t *message, size_t length)
@@ -294,33 +532,88 @@ static bool demo_write_message(session *connection, const uint8_t *message, size
     return true;
 }
 
+static bool close_demo(session *connection)
+{
+    bool success = true;
+
+    if (!connection->demo)
+        return true;
+    if (fflush(connection->demo) != 0)
+        success = false;
+    if (fclose(connection->demo) != 0)
+        success = false;
+    connection->demo = NULL;
+    return success;
+}
+
 static void open_demo(app *proxy, session *connection)
 {
     time_t current_time;
     struct tm local_time;
     char timestamp[32];
     char address[INET_ADDRSTRLEN];
+    int descriptor;
+    int open_flags = O_WRONLY | O_CREAT | O_EXCL;
+    int path_length;
+    bool created = false;
 
     if (!proxy->cfg.record_dir[0] || connection->demo)
         return;
     current_time = time(NULL);
-    localtime_r(&current_time, &local_time);
-    strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", &local_time);
+    if (!local_time_value(current_time, &local_time) ||
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", &local_time) == 0) {
+        app_log(proxy, 0, "session %lu: cannot create demo timestamp\n", connection->id);
+        return;
+    }
     if (!inet_ntop(AF_INET, &connection->client.sin_addr, address, sizeof(address)))
         snprintf(address, sizeof(address), "client");
-    snprintf(connection->demo_path, sizeof(connection->demo_path), "%s/faqproxy-%s-%s-%u-%lu.dem",
-             proxy->cfg.record_dir, timestamp, address,
-             (unsigned int)ntohs(connection->client.sin_port), connection->id);
-    connection->demo = fopen(connection->demo_path, "wb");
+    path_length =
+        snprintf(connection->demo_path, sizeof(connection->demo_path),
+                 "%s/faqproxy-%s-%s-%u-%lu.dem", proxy->cfg.record_dir, timestamp, address,
+                 (unsigned int)ntohs(connection->client.sin_port), connection->id);
+    if (path_length < 0 || (size_t)path_length >= sizeof(connection->demo_path)) {
+        app_log(proxy, 0, "session %lu: demo path is too long\n", connection->id);
+        connection->demo_path[0] = 0;
+        return;
+    }
+#ifdef O_CLOEXEC
+    open_flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    open_flags |= O_NOFOLLOW;
+#endif
+#ifdef _WIN32
+    open_flags |= _O_BINARY | _O_NOINHERIT;
+    descriptor = _open(connection->demo_path, open_flags, _S_IREAD | _S_IWRITE);
+#else
+    descriptor = open(connection->demo_path, open_flags, 0640);
+#endif
+    if (descriptor >= 0)
+        created = true;
+    if (descriptor >= 0 && !set_close_on_exec(descriptor)) {
+        int saved_error = errno;
+
+        (void)close_file_descriptor(descriptor);
+        errno = saved_error;
+        descriptor = -1;
+    }
+    if (descriptor >= 0)
+        connection->demo = file_descriptor_stream(descriptor);
     if (!connection->demo) {
+        int saved_error = errno;
+
+        if (descriptor >= 0)
+            (void)close_file_descriptor(descriptor);
+        if (created)
+            (void)delete_file(connection->demo_path);
         app_log(proxy, 0, "session %lu: cannot record %s: %s\n", connection->id,
-                connection->demo_path, strerror(errno));
+                connection->demo_path, strerror(saved_error));
         connection->demo_path[0] = 0;
         return;
     }
     if (fputs("-1\n", connection->demo) < 0) {
-        fclose(connection->demo);
-        connection->demo = NULL;
+        (void)close_demo(connection);
+        (void)delete_file(connection->demo_path);
         connection->demo_path[0] = 0;
         return;
     }
@@ -339,14 +632,12 @@ static void close_session(app *proxy, int index, const char *reason)
             (unsigned long long)connection->bytes_from_client,
             (unsigned long long)connection->packets_from_server,
             (unsigned long long)connection->bytes_from_server);
-    if (connection->demo) {
-        if (fflush(connection->demo) != 0 || fclose(connection->demo) != 0)
-            app_log(proxy, 0, "session %lu: warning: demo write failed\n", connection->id);
-    }
-    if (connection->upstream_fd >= 0)
-        close(connection->upstream_fd);
+    if (!close_demo(connection))
+        app_log(proxy, 0, "session %lu: warning: demo write failed\n", connection->id);
+    if (connection->upstream_fd != PROXY_INVALID_SOCKET)
+        close_socket(connection->upstream_fd);
     memset(connection, 0, sizeof(*connection));
-    connection->upstream_fd = -1;
+    connection->upstream_fd = PROXY_INVALID_SOCKET;
     connection->state = SESSION_FREE;
 }
 
@@ -373,7 +664,7 @@ static int allocate_session(app *proxy, const struct sockaddr_in *client, sessio
         connection = &proxy->sessions[i];
         memset(connection, 0, sizeof(*connection));
         connection->upstream_fd = open_upstream_socket();
-        if (connection->upstream_fd < 0)
+        if (connection->upstream_fd == PROXY_INVALID_SOCKET)
             return -1;
         connection->state = state;
         connection->client = *client;
@@ -383,6 +674,34 @@ static int allocate_session(app *proxy, const struct sockaddr_in *client, sessio
         return i;
     }
     return -1;
+}
+
+static void restart_session(app *proxy, int index, bool proquake_requested)
+{
+    session *connection = &proxy->sessions[index];
+    proxy_socket upstream_fd = connection->upstream_fd;
+    struct sockaddr_in client = connection->client;
+    unsigned long previous_id = connection->id;
+
+    if (!close_demo(connection))
+        app_log(proxy, 0, "session %lu: warning: demo write failed during reconnect\n",
+                previous_id);
+    memset(connection, 0, sizeof(*connection));
+    connection->state = SESSION_CONNECTING;
+    connection->upstream_fd = upstream_fd;
+    connection->id = ++proxy->next_session_id;
+    connection->client = client;
+    connection->server = proxy->cfg.target_address;
+    connection->last_activity_ms = monotonic_milliseconds();
+    connection->proquake_requested = proquake_requested;
+    app_log(proxy, 0, "session %lu: reconnecting as session %lu with the same upstream port\n",
+            previous_id, connection->id);
+}
+
+static bool is_query_command(uint8_t command)
+{
+    return command == NQ_CCREQ_SERVER_INFO || command == NQ_CCREQ_PLAYER_INFO ||
+           command == NQ_CCREQ_RULE_INFO || command == NQ_CCREQ_RCON;
 }
 
 static void reject_client(app *proxy, const struct sockaddr_in *client, const char *reason)
@@ -397,17 +716,26 @@ static void reject_client(app *proxy, const struct sockaddr_in *client, const ch
 static void detect_protocol(app *proxy, session *connection, const uint8_t *message, size_t length)
 {
     uint32_t flags = 0;
-    int protocol = nq_find_server_protocol(message, length, &flags);
+    uint32_t pext2_flags = 0;
+    int protocol;
 
-    if (!protocol)
+    if (connection->protocol)
         return;
-    if (connection->protocol == protocol && connection->protocol_flags == flags)
+    protocol = nq_find_server_protocol(message, length, &flags, &pext2_flags);
+    if (!protocol)
         return;
     connection->protocol = protocol;
     connection->protocol_flags = flags;
-    if (protocol == NQ_PROTOCOL_RMQ)
+    connection->pext2_flags = pext2_flags;
+    if (protocol == NQ_PROTOCOL_RMQ && pext2_flags)
+        app_log(proxy, 0, "session %lu: protocol %d (%s), flags 0x%08x, FTE2 flags 0x%08x\n",
+                connection->id, protocol, nq_protocol_name(protocol), flags, pext2_flags);
+    else if (protocol == NQ_PROTOCOL_RMQ)
         app_log(proxy, 0, "session %lu: protocol %d (%s), flags 0x%08x\n", connection->id, protocol,
                 nq_protocol_name(protocol), flags);
+    else if (pext2_flags)
+        app_log(proxy, 0, "session %lu: protocol %d (%s), FTE2 flags 0x%08x\n", connection->id,
+                protocol, nq_protocol_name(protocol), pext2_flags);
     else
         app_log(proxy, 0, "session %lu: protocol %d (%s)\n", connection->id, protocol,
                 nq_protocol_name(protocol));
@@ -437,7 +765,9 @@ static void inspect_client_message(session *connection, const uint8_t *message, 
     while (offset < length) {
         uint8_t command = message[offset++];
 
-        if (command == 0 || command == 1)
+        if (command == 0)
+            return;
+        if (command == 1)
             continue;
         if (command == 2)
             return;
@@ -450,17 +780,24 @@ static void inspect_client_message(session *connection, const uint8_t *message, 
             int i;
             size_t angle_bytes;
 
-            if (offset + 4 > length)
+            if (connection->pext2_flags & NQ_PEXT2_PREDINFO) {
+                if (offset + 6 > length)
+                    return;
+                offset += 6; /* command sequence and client timestamp */
+            } else if (offset + 4 <= length) {
+                offset += 4; /* client timestamp */
+            } else {
                 return;
-            offset += 4; /* client timestamp */
+            }
             if (connection->protocol == NQ_PROTOCOL_RMQ &&
                 (connection->protocol_flags & NQ_PRFL_FLOATANGLE))
                 angle_bytes = 4;
-            else if (connection->protocol == NQ_PROTOCOL_NETQUAKE && !connection->proquake_angles)
+            else if (connection->protocol == NQ_PROTOCOL_NETQUAKE && !connection->proquake_angles &&
+                     !(connection->pext2_flags & NQ_PEXT2_PREDINFO))
                 angle_bytes = 1;
             else
                 angle_bytes = 2;
-            if (offset + angle_bytes * 3 + 8 > length)
+            if (offset + angle_bytes * 3 > length)
                 return;
             for (i = 0; i < 3; ++i) {
                 if (angle_bytes == 1)
@@ -471,8 +808,7 @@ static void inspect_client_message(session *connection, const uint8_t *message, 
                     connection->viewangles[i] = read_float_le(message + offset);
                 offset += angle_bytes;
             }
-            offset += 8; /* three moves, buttons, impulse */
-            continue;
+            return;
         }
         return;
     }
@@ -486,8 +822,7 @@ static void inspect_complete_message(app *proxy, session *connection, bool from_
         if (!demo_write_message(connection, message, length)) {
             app_log(proxy, 0, "session %lu: demo write failed; recording stopped\n",
                     connection->id);
-            fclose(connection->demo);
-            connection->demo = NULL;
+            (void)close_demo(connection);
         }
     } else {
         inspect_client_message(connection, message, length);
@@ -514,19 +849,25 @@ static void inspect_connected_packet(app *proxy, session *connection, bool from_
     if (stream->have_sequence) {
         if (view.sequence == stream->last_sequence)
             return; /* retransmitted while its ACK was in flight */
-        if (view.sequence != stream->last_sequence + 1)
+        if (view.sequence != stream->last_sequence + 1) {
             stream->length = 0;
+            stream->discard_until_eom = true;
+        }
+    }
+    stream->last_sequence = view.sequence;
+    stream->have_sequence = true;
+    if (stream->discard_until_eom) {
+        if (view.flags & NQ_NETFLAG_EOM)
+            stream->discard_until_eom = false;
+        return;
     }
     if (view.payload_length > sizeof(stream->data) - stream->length) {
         stream->length = 0;
-        stream->have_sequence = false;
+        stream->discard_until_eom = !(view.flags & NQ_NETFLAG_EOM);
         return;
     }
     memcpy(stream->data + stream->length, data + view.payload_offset, view.payload_length);
     stream->length += view.payload_length;
-    stream->last_sequence = view.sequence;
-    stream->have_sequence = true;
-
     if (view.flags & NQ_NETFLAG_EOM) {
         inspect_complete_message(proxy, connection, from_server, stream->data, stream->length);
         stream->length = 0;
@@ -539,23 +880,37 @@ static void begin_connect(app *proxy, const struct sockaddr_in *client, const ui
     int index = find_session(proxy, client);
     session *connection;
     char client_text[64];
+    uint64_t now = monotonic_milliseconds();
 
     if (index >= 0) {
         connection = &proxy->sessions[index];
         if (connection->state == SESSION_CONNECTING) {
-            (void)send_datagram(connection->upstream_fd, data, length, &connection->server);
-            connection->last_activity_ms = monotonic_milliseconds();
+            if (send_datagram(connection->upstream_fd, data, length, &connection->server)) {
+                connection->packets_from_client++;
+                connection->bytes_from_client += length;
+            } else {
+                app_log(proxy, 1, "session %lu: retry send failed: %s\n", connection->id,
+                        socket_error_string());
+            }
+            connection->last_activity_ms = now;
             return;
         }
         if (connection->state == SESSION_ESTABLISHED && connection->cached_accept_length) {
-            (void)send_datagram(proxy->listen_fd, connection->cached_accept,
-                                connection->cached_accept_length, &connection->client);
-            return;
+            if (connection->accepted_at_ms &&
+                now - connection->accepted_at_ms < FAQPROXY_DUPLICATE_CONNECT_MS) {
+                (void)send_datagram(proxy->listen_fd, connection->cached_accept,
+                                    connection->cached_accept_length, &connection->client);
+                return;
+            }
+            restart_session(proxy, index, proquake_requested);
+        } else {
+            close_session(proxy, index, "new connection request");
+            index = -1;
         }
-        close_session(proxy, index, "new connection request");
     }
 
-    index = allocate_session(proxy, client, SESSION_CONNECTING);
+    if (index < 0)
+        index = allocate_session(proxy, client, SESSION_CONNECTING);
     if (index < 0) {
         reject_client(proxy, client, "FAQProxy is full.\n");
         return;
@@ -591,6 +946,9 @@ static void begin_query(app *proxy, const struct sockaddr_in *client, const uint
         connection->last_activity_ms = monotonic_milliseconds();
         connection->packets_from_client++;
         connection->bytes_from_client += length;
+    } else {
+        app_log(proxy, 1, "session %lu: control query send failed: %s\n", connection->id,
+                socket_error_string());
     }
 }
 
@@ -612,6 +970,10 @@ static void handle_client_datagram(app *proxy, const uint8_t *data, size_t lengt
             reject_client(proxy, client, "Incompatible NetQuake connection request.\n");
             return;
         }
+        if (!is_query_command(view.command)) {
+            app_log(proxy, 1, "ignored unsupported control request 0x%02x\n", view.command);
+            return;
+        }
         begin_query(proxy, client, data, length);
         return;
     }
@@ -627,7 +989,11 @@ static void handle_client_datagram(app *proxy, const uint8_t *data, size_t lengt
         connection->packets_from_client++;
         connection->bytes_from_client += length;
         inspect_connected_packet(proxy, connection, false, data, length);
-        app_log(proxy, 2, "session %lu: client -> server %zu bytes\n", connection->id, length);
+        app_log(proxy, 2, "session %lu: client -> server %llu bytes\n", connection->id,
+                (unsigned long long)length);
+    } else {
+        app_log(proxy, 1, "session %lu: client datagram send failed: %s\n", connection->id,
+                socket_error_string());
     }
 }
 
@@ -637,31 +1003,36 @@ static void drain_client_socket(app *proxy)
 
     for (;;) {
         struct sockaddr_in client;
-        socklen_t client_length = sizeof(client);
-        ssize_t received = recvfrom(proxy->listen_fd, data, sizeof(data), 0,
-                                    (struct sockaddr *)&client, &client_length);
+        proxy_socklen client_length = (proxy_socklen)sizeof(client);
+#ifdef _WIN32
+        proxy_io_size received = recvfrom(proxy->listen_fd, (char *)data, (int)sizeof(data), 0,
+                                          (struct sockaddr *)&client, &client_length);
+#else
+        proxy_io_size received = recvfrom(proxy->listen_fd, data, sizeof(data), 0,
+                                          (struct sockaddr *)&client, &client_length);
+#endif
         if (received < 0) {
-            if (errno == EINTR)
+            if (socket_interrupted())
                 continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
-                app_log(proxy, 0, "client receive failed: %s\n", strerror(errno));
+            if (!socket_would_block())
+                app_log(proxy, 0, "client receive failed: %s\n", socket_error_string());
             break;
         }
-        if (client_length == sizeof(client) && received > 0)
+        if (client_length == (proxy_socklen)sizeof(client) && received > 0)
             handle_client_datagram(proxy, data, (size_t)received, &client);
     }
 }
 
-static void accept_upstream_connection(app *proxy, int index, const uint8_t *data, size_t length)
+static bool accept_upstream_connection(app *proxy, session *connection, const uint8_t *data,
+                                       size_t length)
 {
-    session *connection = &proxy->sessions[index];
     uint16_t accepted_port;
     uint8_t rewritten[256];
     size_t rewritten_length;
     bool ignore_port;
 
     if (!nq_accept_port(data, length, &accepted_port))
-        return;
+        return false;
     ignore_port = length >= 12 && data[9] == 1 && (data[11] & NQ_PQF_IGNOREPORT) != 0;
     if (accepted_port && !ignore_port)
         connection->server.sin_port = htons(accepted_port);
@@ -669,22 +1040,25 @@ static void accept_upstream_connection(app *proxy, int index, const uint8_t *dat
     rewritten_length =
         nq_rewrite_accept(rewritten, sizeof(rewritten), data, length, proxy->listen_port);
     if (!rewritten_length)
-        return;
+        return false;
     if (!send_datagram(proxy->listen_fd, rewritten, rewritten_length, &connection->client)) {
-        close_session(proxy, index, "client accept send failed");
-        return;
+        app_log(proxy, 0, "session %lu: client accept send failed: %s\n", connection->id,
+                socket_error_string());
+        return false;
     }
     memcpy(connection->cached_accept, rewritten, rewritten_length);
     connection->cached_accept_length = rewritten_length;
     connection->proquake_angles = connection->proquake_requested && length >= 10 && data[9] == 1;
     connection->state = SESSION_ESTABLISHED;
     connection->last_activity_ms = monotonic_milliseconds();
+    connection->accepted_at_ms = connection->last_activity_ms;
     open_demo(proxy, connection);
     app_log(proxy, 0, "session %lu: upstream accepted on UDP port %u\n", connection->id,
             (unsigned int)ntohs(connection->server.sin_port));
+    return true;
 }
 
-static void drain_upstream_socket(app *proxy, int index, int expected_fd)
+static void drain_upstream_socket(app *proxy, int index, proxy_socket expected_fd)
 {
     uint8_t data[FAQPROXY_PACKET_SIZE];
     session *connection = &proxy->sessions[index];
@@ -693,20 +1067,33 @@ static void drain_upstream_socket(app *proxy, int index, int expected_fd)
         return;
     for (;;) {
         struct sockaddr_in source;
-        socklen_t source_length = sizeof(source);
-        ssize_t received = recvfrom(expected_fd, data, sizeof(data), 0, (struct sockaddr *)&source,
-                                    &source_length);
+        proxy_socklen source_length = (proxy_socklen)sizeof(source);
+#ifdef _WIN32
+        proxy_io_size received = recvfrom(expected_fd, (char *)data, (int)sizeof(data), 0,
+                                          (struct sockaddr *)&source, &source_length);
+#else
+        proxy_io_size received = recvfrom(expected_fd, data, sizeof(data), 0,
+                                          (struct sockaddr *)&source, &source_length);
+#endif
         nq_packet_view view;
 
         if (received < 0) {
-            if (errno == EINTR)
+            if (socket_interrupted())
                 continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
+            if (!socket_would_block())
                 close_session(proxy, index, "upstream receive failed");
             return;
         }
-        if (source_length != sizeof(source) || !address_equal(&source, &connection->server))
+        if (source_length != (proxy_socklen)sizeof(source) ||
+            !address_equal(&source, &connection->server)) {
+            char source_text[64];
+
+            app_log(proxy, 1, "session %lu: ignored upstream packet from %s\n", connection->id,
+                    source_length == (proxy_socklen)sizeof(source)
+                        ? format_address(&source, source_text, sizeof(source_text))
+                        : "an invalid address");
             continue;
+        }
 
         connection->last_activity_ms = monotonic_milliseconds();
         connection->packets_from_server++;
@@ -715,27 +1102,39 @@ static void drain_upstream_socket(app *proxy, int index, int expected_fd)
         if (connection->state == SESSION_CONNECTING &&
             nq_parse_packet(data, (size_t)received, &view) && view.control) {
             if (view.command == NQ_CCREP_ACCEPT) {
-                accept_upstream_connection(proxy, index, data, (size_t)received);
-                if (proxy->sessions[index].state == SESSION_FREE)
+                if (!accept_upstream_connection(proxy, connection, data, (size_t)received)) {
+                    reject_client(proxy, &connection->client,
+                                  "FAQProxy received a malformed server acceptance.\n");
+                    close_session(proxy, index, "malformed upstream acceptance");
                     return;
+                }
                 connection = &proxy->sessions[index];
                 continue;
             }
-            (void)send_datagram(proxy->listen_fd, data, (size_t)received, &connection->client);
             if (view.command == NQ_CCREP_REJECT) {
+                (void)send_datagram(proxy->listen_fd, data, (size_t)received, &connection->client);
                 close_session(proxy, index, "upstream rejected connection");
                 return;
             }
+            app_log(proxy, 1, "session %lu: ignored unexpected control reply 0x%02x\n",
+                    connection->id, view.command);
+            continue;
+        }
+        if (connection->state == SESSION_CONNECTING) {
+            app_log(proxy, 1, "session %lu: ignored non-control data before acceptance\n",
+                    connection->id);
             continue;
         }
 
         if (!send_datagram(proxy->listen_fd, data, (size_t)received, &connection->client)) {
-            close_session(proxy, index, "client send failed");
-            return;
+            app_log(proxy, 1, "session %lu: server datagram send failed: %s\n", connection->id,
+                    socket_error_string());
+            continue;
         }
         if (connection->state == SESSION_ESTABLISHED)
             inspect_connected_packet(proxy, connection, true, data, (size_t)received);
-        app_log(proxy, 2, "session %lu: server -> client %zd bytes\n", connection->id, received);
+        app_log(proxy, 2, "session %lu: server -> client %ld bytes\n", connection->id,
+                (long)received);
     }
 }
 
@@ -762,13 +1161,22 @@ static void expire_sessions(app *proxy)
     }
 }
 
+static int poll_sockets(proxy_pollfd *descriptors, proxy_nfds count, int timeout)
+{
+#ifdef _WIN32
+    return WSAPoll(descriptors, count, timeout);
+#else
+    return poll(descriptors, count, timeout);
+#endif
+}
+
 static int run_proxy(app *proxy)
 {
-    struct pollfd descriptors[FAQPROXY_MAX_SESSIONS + 1];
+    proxy_pollfd descriptors[FAQPROXY_MAX_SESSIONS + 1];
     int session_map[FAQPROXY_MAX_SESSIONS + 1];
 
     while (!stop_requested) {
-        nfds_t count = 1;
+        proxy_nfds count = 1;
         int i;
         int status;
 
@@ -786,15 +1194,19 @@ static int run_proxy(app *proxy)
             ++count;
         }
 
-        status = poll(descriptors, count, FAQPROXY_POLL_MS);
+        status = poll_sockets(descriptors, count, FAQPROXY_POLL_MS);
         if (status < 0) {
-            if (errno == EINTR)
+            if (socket_interrupted())
                 continue;
-            fprintf(stderr, "poll failed: %s\n", strerror(errno));
+            fprintf(stderr, "poll failed: %s\n", socket_error_string());
             return 1;
         }
         if (descriptors[0].revents & POLLIN)
             drain_client_socket(proxy);
+        if (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "listen socket failed\n");
+            return 1;
+        }
         for (i = 1; i < (int)count; ++i) {
             if (descriptors[i].revents & POLLIN)
                 drain_upstream_socket(proxy, session_map[i], descriptors[i].fd);
@@ -842,59 +1254,122 @@ static bool parse_unsigned(const char *text, unsigned int minimum, unsigned int 
     return true;
 }
 
-int main(int argc, char **argv)
-{
-    static const struct option options[] = {{"listen", required_argument, NULL, 'l'},
-                                            {"record-dir", required_argument, NULL, 'r'},
-                                            {"max-clients", required_argument, NULL, 'm'},
-                                            {"timeout", required_argument, NULL, 't'},
-                                            {"verbose", no_argument, NULL, 'v'},
-                                            {"version", no_argument, NULL, 1000},
-                                            {"help", no_argument, NULL, 'h'},
-                                            {NULL, 0, NULL, 0}};
-    app *proxy;
-    const char *listen_argument = "0.0.0.0:26000";
-    unsigned int value;
-    int option;
-    int exit_status;
-    int i;
+typedef enum command_line_result {
+    COMMAND_LINE_RUN = 0,
+    COMMAND_LINE_EXIT_OK,
+    COMMAND_LINE_EXIT_ERROR
+} command_line_result;
 
-    proxy = calloc(1, sizeof(*proxy));
-    if (!proxy) {
-        fprintf(stderr, "Out of memory\n");
-        return 1;
+static bool match_long_option(const char *argument, const char *name, const char **inline_value)
+{
+    size_t length = strlen(name);
+
+    if (strncmp(argument, name, length) != 0)
+        return false;
+    if (argument[length] == 0) {
+        *inline_value = NULL;
+        return true;
     }
-    proxy->listen_fd = -1;
-    proxy->cfg.max_sessions = 32;
-    proxy->cfg.idle_timeout_seconds = 120;
-    while ((option = getopt_long(argc, argv, "l:r:m:t:vh", options, NULL)) != -1) {
+    if (argument[length] != '=')
+        return false;
+    *inline_value = argument + length + 1;
+    return true;
+}
+
+static command_line_result parse_command_line(app *proxy, int argc, char **argv,
+                                              const char **listen_argument,
+                                              const char **server_argument)
+{
+    int index = 1;
+    unsigned int parsed_value;
+
+    while (index < argc) {
+        const char *argument = argv[index];
+        const char *value = NULL;
+        int option = 0;
+
+        if (strcmp(argument, "--") == 0) {
+            ++index;
+            break;
+        }
+        if (argument[0] != '-' || argument[1] == 0)
+            break;
+        if (argument[1] == '-') {
+            if (strcmp(argument, "--help") == 0)
+                option = 'h';
+            else if (strcmp(argument, "--version") == 0)
+                option = 1000;
+            else if (strcmp(argument, "--verbose") == 0)
+                option = 'v';
+            else if (match_long_option(argument, "--listen", &value))
+                option = 'l';
+            else if (match_long_option(argument, "--record-dir", &value))
+                option = 'r';
+            else if (match_long_option(argument, "--max-clients", &value))
+                option = 'm';
+            else if (match_long_option(argument, "--timeout", &value))
+                option = 't';
+        } else if (argument[1] == 'l' || argument[1] == 'r' || argument[1] == 'm' ||
+                   argument[1] == 't') {
+            option = (unsigned char)argument[1];
+            if (argument[2])
+                value = argument + 2;
+        } else if (argument[1] == 'v') {
+            const char *character = argument + 1;
+
+            while (*character == 'v') {
+                if (proxy->cfg.verbose < 2)
+                    ++proxy->cfg.verbose;
+                ++character;
+            }
+            if (*character)
+                option = 0;
+            else {
+                ++index;
+                continue;
+            }
+        } else if (strcmp(argument, "-h") == 0) {
+            option = 'h';
+        }
+
+        if (!option) {
+            fprintf(stderr, "Unknown option: %s\n", argument);
+            print_usage(stderr, argv[0]);
+            return COMMAND_LINE_EXIT_ERROR;
+        }
+        if ((option == 'l' || option == 'r' || option == 'm' || option == 't') && !value) {
+            if (++index >= argc) {
+                fprintf(stderr, "Option %s requires a value\n", argument);
+                print_usage(stderr, argv[0]);
+                return COMMAND_LINE_EXIT_ERROR;
+            }
+            value = argv[index];
+        }
+
         switch (option) {
         case 'l':
-            listen_argument = optarg;
+            *listen_argument = value;
             break;
         case 'r':
-            if (strlen(optarg) >= sizeof(proxy->cfg.record_dir)) {
+            if (strlen(value) >= sizeof(proxy->cfg.record_dir)) {
                 fprintf(stderr, "Record directory path is too long\n");
-                free(proxy);
-                return 2;
+                return COMMAND_LINE_EXIT_ERROR;
             }
-            memcpy(proxy->cfg.record_dir, optarg, strlen(optarg) + 1);
+            memcpy(proxy->cfg.record_dir, value, strlen(value) + 1);
             break;
         case 'm':
-            if (!parse_unsigned(optarg, 1, FAQPROXY_MAX_SESSIONS, &value)) {
+            if (!parse_unsigned(value, 1, FAQPROXY_MAX_SESSIONS, &parsed_value)) {
                 fprintf(stderr, "--max-clients must be between 1 and %d\n", FAQPROXY_MAX_SESSIONS);
-                free(proxy);
-                return 2;
+                return COMMAND_LINE_EXIT_ERROR;
             }
-            proxy->cfg.max_sessions = (int)value;
+            proxy->cfg.max_sessions = (int)parsed_value;
             break;
         case 't':
-            if (!parse_unsigned(optarg, 0, 86400, &value)) {
+            if (!parse_unsigned(value, 0, 86400, &parsed_value)) {
                 fprintf(stderr, "--timeout must be between 0 and 86400 seconds\n");
-                free(proxy);
-                return 2;
+                return COMMAND_LINE_EXIT_ERROR;
             }
-            proxy->cfg.idle_timeout_seconds = value;
+            proxy->cfg.idle_timeout_seconds = parsed_value;
             break;
         case 'v':
             if (proxy->cfg.verbose < 2)
@@ -902,27 +1377,52 @@ int main(int argc, char **argv)
             break;
         case 1000:
             printf("faqproxy %s\n", FAQPROXY_VERSION);
-            free(proxy);
-            return 0;
+            return COMMAND_LINE_EXIT_OK;
         case 'h':
             print_usage(stdout, argv[0]);
-            free(proxy);
-            return 0;
+            return COMMAND_LINE_EXIT_OK;
         default:
-            print_usage(stderr, argv[0]);
-            free(proxy);
-            return 2;
+            return COMMAND_LINE_EXIT_ERROR;
         }
+        ++index;
     }
-    if (optind + 1 != argc) {
+
+    if (index + 1 != argc) {
         print_usage(stderr, argv[0]);
+        return COMMAND_LINE_EXIT_ERROR;
+    }
+    *server_argument = argv[index];
+    return COMMAND_LINE_RUN;
+}
+
+int main(int argc, char **argv)
+{
+    app *proxy;
+    const char *listen_argument = "0.0.0.0:26000";
+    const char *server_argument = NULL;
+    command_line_result command_line;
+    int exit_status;
+    int i;
+
+    if (!initialize_network())
+        return 1;
+    proxy = calloc(1, sizeof(*proxy));
+    if (!proxy) {
+        fprintf(stderr, "Out of memory\n");
+        return 1;
+    }
+    proxy->listen_fd = PROXY_INVALID_SOCKET;
+    proxy->cfg.max_sessions = 32;
+    proxy->cfg.idle_timeout_seconds = 120;
+    command_line = parse_command_line(proxy, argc, argv, &listen_argument, &server_argument);
+    if (command_line != COMMAND_LINE_RUN) {
         free(proxy);
-        return 2;
+        return command_line == COMMAND_LINE_EXIT_OK ? 0 : 2;
     }
     if (!resolve_endpoint(listen_argument, "0.0.0.0", NQ_DEFAULT_PORT, true,
                           &proxy->cfg.listen_address, proxy->cfg.listen_text,
                           sizeof(proxy->cfg.listen_text)) ||
-        !resolve_endpoint(argv[optind], NULL, NQ_DEFAULT_PORT, false, &proxy->cfg.target_address,
+        !resolve_endpoint(server_argument, NULL, NQ_DEFAULT_PORT, false, &proxy->cfg.target_address,
                           proxy->cfg.target_text, sizeof(proxy->cfg.target_text))) {
         free(proxy);
         return 2;
@@ -935,16 +1435,19 @@ int main(int argc, char **argv)
     }
 
     for (i = 0; i < FAQPROXY_MAX_SESSIONS; ++i)
-        proxy->sessions[i].upstream_fd = -1;
+        proxy->sessions[i].upstream_fd = PROXY_INVALID_SOCKET;
     proxy->listen_fd = open_listen_socket(&proxy->cfg.listen_address, &proxy->listen_port);
-    if (proxy->listen_fd < 0) {
-        fprintf(stderr, "Cannot listen on %s: %s\n", proxy->cfg.listen_text, strerror(errno));
+    if (proxy->listen_fd == PROXY_INVALID_SOCKET) {
+        fprintf(stderr, "Cannot listen on %s: %s\n", proxy->cfg.listen_text, socket_error_string());
         free(proxy);
         return 1;
     }
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
-    signal(SIGPIPE, SIG_IGN);
+    if (!install_signal_handlers()) {
+        fprintf(stderr, "Cannot install signal handlers: %s\n", strerror(errno));
+        close_socket(proxy->listen_fd);
+        free(proxy);
+        return 1;
+    }
 
     fprintf(stderr,
             "faqproxy %s: NetQuake protocols 15/666/999\n"
@@ -957,7 +1460,7 @@ int main(int argc, char **argv)
     exit_status = run_proxy(proxy);
     for (i = 0; i < proxy->cfg.max_sessions; ++i)
         close_session(proxy, i, "proxy shutdown");
-    close(proxy->listen_fd);
+    close_socket(proxy->listen_fd);
     fprintf(stderr, "faqproxy stopped\n");
     free(proxy);
     return exit_status;
