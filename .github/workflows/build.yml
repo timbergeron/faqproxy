@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            artifact: faqproxy-linux
+          - name: macOS
+            os: macos-latest
+            artifact: faqproxy-macos
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build and test
+        run: make test
+
+      - name: Show binary type
+        run: file build/faqproxy
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/faqproxy
+          if-no-files-found: error
+          retention-days: 14
+
+  sanitize:
+    name: Sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run AddressSanitizer and UndefinedBehaviorSanitizer
+        run: make sanitize

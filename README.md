@@ -53,6 +53,8 @@ make test
 
 The binary is `build/faqproxy`. The tests start a mock NetQuake server and client, perform the real connection handshake, verify byte-identical reliable and unreliable traffic for all three protocols, and validate the resulting demo files.
 
+GitHub Actions runs the same build and tests on Linux and macOS for every push to `main` and every pull request. Successful runs retain downloadable `faqproxy-linux` and `faqproxy-macos` binaries for 14 days. The Linux job also runs the sanitizer test target.
+
 For an AddressSanitizer and UndefinedBehaviorSanitizer build:
 
 ```sh
