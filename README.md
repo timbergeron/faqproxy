@@ -4,6 +4,12 @@ FAQProxy is a clean, NetQuake-only recreation of the original FAQProxy idea: put
 
 This repository is an independent implementation. It is not the historical FAQProxy source and is not affiliated with its original authors.
 
+## Historical credit
+
+The original FAQProxy was created in 1997 by Juha “Perkele” Kujala and Ilkka “Zibbo” Rajala of the Finnish Allied Quakers (FAQ) clan. Their protocol-aware NetQuake proxy pioneered external demo recording, spectator and chase-camera experiments, teamplay tools, and programmable network routing without requiring changes to the client or server. Their work later evolved into Qizmo and helped establish the idea of a game-aware proxy as an extension platform.
+
+This project is named in recognition of that work. All credit for the original FAQProxy concept, design, and historical implementation belongs to Perkele, Zibbo, and the original FAQProxy contributors. The code in this repository is a new implementation based on publicly understood NetQuake protocol behavior and modern engine references.
+
 ## What works now
 
 - NetQuake UDP connection and control protocol version 3
