@@ -1,0 +1,20 @@
+[Unit]
+Description=FAQProxy NetQuake relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=faqproxy
+Group=faqproxy
+ExecStart=/opt/faqproxy/faqproxy --listen 0.0.0.0:26000 --record-dir /var/lib/faqproxy/demos quake.example.net:26000
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/faqproxy
+
+[Install]
+WantedBy=multi-user.target

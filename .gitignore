@@ -1,0 +1,6 @@
+/build/
+/demos/
+*.dem
+*.dSYM/
+*.o
+*.plist
