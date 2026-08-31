@@ -265,11 +265,12 @@ def main() -> None:
             limited_upstream,
         )
         assert receive(limited_player)[0][4] == 0x81
-        for sequence in range(4):
-            packet = connected(sequence, b"x" * 60000)
+        unconfirmed_payload = b"x" * 8000
+        for sequence in range(32):
+            packet = connected(sequence, unconfirmed_payload)
             limited_game.sendto(packet, limited_upstream)
             assert receive(limited_player)[0] == packet
-        limited_game.sendto(connected(4, b"x" * 60000), limited_upstream)
+        limited_game.sendto(connected(32, unconfirmed_payload), limited_upstream)
         expect_no_packet(limited_player, 0.4)
 
         confirmed_player = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
