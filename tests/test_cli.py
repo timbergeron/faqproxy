@@ -8,6 +8,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import time
 
 
 def run(binary: pathlib.Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -75,9 +76,36 @@ def main() -> None:
             real_directory.mkdir()
             link = root / "record-link"
             link.symlink_to(real_directory, target_is_directory=True)
-            result = run(binary, "--record-dir", str(link), "127.0.0.1:26000")
+            result = run(binary, "--record-dir", f"{link}{os.sep}", "127.0.0.1:26000")
             assert result.returncode == 2, result
             assert "Cannot create or use record directory" in result.stderr, result.stderr
+
+            ancestor = root / "ancestor"
+            ancestor.symlink_to(real_directory, target_is_directory=True)
+            nested = ancestor / "nested"
+            process = subprocess.Popen(
+                [
+                    str(binary.resolve()),
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--record-dir",
+                    str(nested),
+                    "127.0.0.1:26000",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                time.sleep(0.15)
+                if process.poll() is not None:
+                    raise RuntimeError(process.stderr.read())
+                assert nested.is_dir()
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                process.communicate(timeout=3)
+            assert process.returncode == 0
 
     print("command-line validation passed")
 

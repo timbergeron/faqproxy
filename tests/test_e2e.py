@@ -51,9 +51,40 @@ def free_udp_port() -> int:
     return port
 
 
+def unique_client_socket(used_ports: set[int]) -> socket.socket:
+    held: list[socket.socket] = []
+
+    while True:
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.bind(("127.0.0.1", 0))
+        port = client.getsockname()[1]
+        if port not in used_ports:
+            used_ports.add(port)
+            for other in held:
+                other.close()
+            return client
+        held.append(client)
+
+
 def receive(sock: socket.socket) -> tuple[bytes, tuple[str, int]]:
-    data, address = sock.recvfrom(65535)
-    return data, (address[0], address[1])
+    timeout = sock.gettimeout()
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    try:
+        while True:
+            try:
+                data, address = sock.recvfrom(65535)
+                return data, (address[0], address[1])
+            except ConnectionResetError:
+                if os.name != "nt":
+                    raise
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout
+                    sock.settimeout(remaining)
+    finally:
+        sock.settimeout(timeout)
 
 
 def connect_request(proquake: bool = False) -> bytes:
@@ -89,9 +120,9 @@ def exercise_protocol(
     case: ProtocolCase,
     proxy_port: int,
     control_server: socket.socket,
+    used_client_ports: set[int],
 ) -> tuple[bytes, tuple[float, float, float]]:
-    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    client.bind(("127.0.0.1", 0))
+    client = unique_client_socket(used_client_ports)
     client.settimeout(3)
 
     request = connect_request(case.proquake)
@@ -182,9 +213,10 @@ def verify_demos(
         assert record_counts[marker] == 1, (marker, record_counts[marker])
 
 
-def verify_reconnect(proxy_port: int, control_server: socket.socket) -> None:
-    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    client.bind(("127.0.0.1", 0))
+def verify_reconnect(
+    proxy_port: int, control_server: socket.socket, used_client_ports: set[int]
+) -> None:
+    client = unique_client_socket(used_client_ports)
     client.settimeout(3)
     request = connect_request()
 
@@ -219,9 +251,10 @@ def verify_reconnect(proxy_port: int, control_server: socket.socket) -> None:
     game_server.close()
 
 
-def verify_control_query(proxy_port: int, control_server: socket.socket) -> None:
-    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    client.bind(("127.0.0.1", 0))
+def verify_control_query(
+    proxy_port: int, control_server: socket.socket, used_client_ports: set[int]
+) -> None:
+    client = unique_client_socket(used_client_ports)
     client.settimeout(3)
     request = control(0x02, b"QUAKE\x00\x03")
     response = control(0x83, b"192.0.2.10:26000\x00mock server\x00")
@@ -268,6 +301,7 @@ def main() -> None:
     server.bind(("127.0.0.1", 0))
     server.settimeout(3)
     proxy_port = free_udp_port()
+    used_client_ports: set[int] = set()
 
     with tempfile.TemporaryDirectory(prefix="faqproxy-test-") as temp:
         record_dir = pathlib.Path(temp) / "private" / "nested" / "demos"
@@ -298,9 +332,11 @@ def main() -> None:
                 ProtocolCase(4, 666, "short"),
                 ProtocolCase(5, 999, "float"),
             ]
-            expected = [exercise_protocol(case, proxy_port, server) for case in cases]
-            verify_control_query(proxy_port, server)
-            verify_reconnect(proxy_port, server)
+            expected = [
+                exercise_protocol(case, proxy_port, server, used_client_ports) for case in cases
+            ]
+            verify_control_query(proxy_port, server, used_client_ports)
+            verify_reconnect(proxy_port, server, used_client_ports)
         finally:
             if os.name == "nt":
                 process.send_signal(signal.CTRL_BREAK_EVENT)

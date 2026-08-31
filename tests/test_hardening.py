@@ -37,8 +37,24 @@ def connect_request(proquake: bool = False) -> bytes:
 
 
 def receive(sock: socket.socket) -> tuple[bytes, tuple[str, int]]:
-    data, address = sock.recvfrom(65535)
-    return data, (address[0], address[1])
+    timeout = sock.gettimeout()
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    try:
+        while True:
+            try:
+                data, address = sock.recvfrom(65535)
+                return data, (address[0], address[1])
+            except ConnectionResetError:
+                if os.name != "nt":
+                    raise
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout
+                    sock.settimeout(remaining)
+    finally:
+        sock.settimeout(timeout)
 
 
 def free_udp_port() -> int:

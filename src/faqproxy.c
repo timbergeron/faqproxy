@@ -623,19 +623,20 @@ static int delete_file(const char *path)
 #endif
 }
 
-static bool ensure_one_directory(const char *path)
+static bool ensure_one_directory(const char *path, bool reject_symlink)
 {
     struct stat information;
     int status;
 
 #ifdef _WIN32
+    (void)reject_symlink;
     status = stat(path, &information);
 #else
-    status = lstat(path, &information);
+    status = reject_symlink ? lstat(path, &information) : stat(path, &information);
 #endif
     if (status == 0) {
 #ifndef _WIN32
-        if (S_ISLNK(information.st_mode)) {
+        if (reject_symlink && S_ISLNK(information.st_mode)) {
             errno = ELOOP;
             return false;
         }
@@ -654,14 +655,24 @@ static bool ensure_record_directory(const char *path)
 {
     char copy[PATH_MAX];
     char *cursor;
+    size_t length;
 
     if (!*path)
         return true;
-    if (strlen(path) >= sizeof(copy)) {
+    length = strlen(path);
+    if (length >= sizeof(copy)) {
         errno = ENAMETOOLONG;
         return false;
     }
-    memcpy(copy, path, strlen(path) + 1);
+    memcpy(copy, path, length + 1);
+#ifdef _WIN32
+    while (length > 1 && (copy[length - 1] == '/' || copy[length - 1] == '\\') &&
+           !(length == 3 && copy[1] == ':'))
+        copy[--length] = 0;
+#else
+    while (length > 1 && copy[length - 1] == '/')
+        copy[--length] = 0;
+#endif
     cursor = copy;
 #ifdef _WIN32
     if (copy[0] && copy[1] == ':')
@@ -679,12 +690,12 @@ static bool ensure_record_directory(const char *path)
             char saved = *cursor;
 
             *cursor = 0;
-            if (!ensure_one_directory(copy))
+            if (!ensure_one_directory(copy, false))
                 return false;
             *cursor = saved;
         }
     }
-    return ensure_one_directory(copy);
+    return ensure_one_directory(copy, true);
 }
 
 static bool demo_write_message(session *connection, const uint8_t *message, size_t length)

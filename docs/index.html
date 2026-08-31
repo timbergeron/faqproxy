@@ -1156,7 +1156,7 @@ make test</code></pre>
             <p>Recordings retain the server's original 15, 666, or 999 messages and follow the connected player's view.</p>
             <ul>
               <li>Existing paths are never overwritten.</li>
-              <li>New Unix directories use <code>0700</code>, symlinked components are rejected, and files use at most <code>0640</code>; the service unit tightens them to <code>0600</code>.</li>
+              <li>New Unix directories use <code>0700</code>, the final recording directory may not be a symlink, and files use at most <code>0640</code>; the service unit tightens them to <code>0600</code>.</li>
               <li>Each demo is capped at 1024 MiB by default.</li>
               <li>Recording failure never stops packet forwarding.</li>
               <li>Play back in an engine that supports the recorded protocol.</li>
