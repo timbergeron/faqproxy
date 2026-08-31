@@ -45,7 +45,24 @@
 #define FAQPROXY_QUERY_TIMEOUT_MS UINT64_C(5000)
 #define FAQPROXY_DUPLICATE_CONNECT_MS UINT64_C(2000)
 #define FAQPROXY_POLL_MS 250
+#define FAQPROXY_MAX_CONTROL_PACKET 1024
+#define FAQPROXY_MAX_QUERY_SESSIONS 16
+#define FAQPROXY_MAX_DATAGRAMS_PER_TICK 64
+#define FAQPROXY_DEFAULT_MAX_DEMO_MIB 1024
+#define FAQPROXY_CONFIRM_TIMEOUT_MS UINT64_C(5000)
+#define FAQPROXY_UNCONFIRMED_MAX_PACKETS 256
+#define FAQPROXY_UNCONFIRMED_MAX_BYTES (UINT64_C(256) * UINT64_C(1024))
+#define FAQPROXY_DEFAULT_CONNECT_RATE 16
+#define FAQPROXY_DEFAULT_QUERY_RATE 32
+#define FAQPROXY_REJECT_RATE 4
+#define FAQPROXY_REJECT_BURST 8
+#define NQ_PQF_CHEATFREE 0x01
 #define NQ_PQF_IGNOREPORT 0x80
+#define NQ_CLC_NOP 1
+#define NQ_CLC_DISCONNECT 2
+#define NQ_CLC_MOVE 3
+#define NQ_CLC_STRINGCMD 4
+#define NQ_CLC_ACKFRAME 50
 
 #ifdef _WIN32
 typedef SOCKET proxy_socket;
@@ -78,13 +95,18 @@ typedef struct reassembly {
     bool discard_until_eom;
 } reassembly;
 
+typedef struct rate_limiter {
+    uint64_t last_refill_ms;
+    uint64_t scaled_tokens;
+} rate_limiter;
+
 typedef struct session {
     session_state state;
     proxy_socket upstream_fd;
     unsigned long id;
     struct sockaddr_in client;
     struct sockaddr_in server;
-    uint64_t last_activity_ms;
+    uint64_t last_client_activity_ms;
     uint64_t bytes_from_client;
     uint64_t bytes_from_server;
     uint64_t packets_from_client;
@@ -97,11 +119,22 @@ typedef struct session {
     int protocol;
     uint32_t protocol_flags;
     uint32_t pext2_flags;
+    uint32_t server_unreliable_sequence;
+    uint32_t client_unreliable_sequence;
+    bool have_server_unreliable_sequence;
+    bool have_client_unreliable_sequence;
+    bool client_confirmed;
+    unsigned int unconfirmed_packets_from_server;
+    uint64_t unconfirmed_bytes_from_server;
     float viewangles[3];
     reassembly server_reliable;
     reassembly client_reliable;
     FILE *demo;
+    uint64_t demo_bytes;
+    uint64_t demo_limit_bytes;
+    bool demo_limit_hit;
     char demo_path[PATH_MAX];
+    uint8_t query_command;
 } session;
 
 typedef struct config {
@@ -109,10 +142,16 @@ typedef struct config {
     struct sockaddr_in target_address;
     char listen_text[128];
     char target_text[128];
+    char advertise[128];
     char record_dir[PATH_MAX];
+    uint64_t max_demo_bytes;
     unsigned int idle_timeout_seconds;
+    unsigned int connect_rate;
+    unsigned int query_rate;
     int max_sessions;
     int verbose;
+    bool allow_player_info;
+    bool allow_rcon;
 } config;
 
 typedef struct app {
@@ -120,6 +159,9 @@ typedef struct app {
     proxy_socket listen_fd;
     uint16_t listen_port;
     unsigned long next_session_id;
+    rate_limiter connect_limiter;
+    rate_limiter query_limiter;
+    rate_limiter reject_limiter;
     session sessions[FAQPROXY_MAX_SESSIONS];
 } app;
 
@@ -233,6 +275,36 @@ static uint64_t monotonic_milliseconds(void)
 #endif
 }
 
+static bool rate_limiter_allow(rate_limiter *limiter, unsigned int rate,
+                               unsigned int burst)
+{
+    uint64_t now;
+    uint64_t maximum;
+    uint64_t elapsed;
+    uint64_t refill;
+
+    if (!rate)
+        return true;
+    now = monotonic_milliseconds();
+    maximum = (uint64_t)burst * UINT64_C(1000);
+    if (!limiter->last_refill_ms) {
+        limiter->last_refill_ms = now;
+        limiter->scaled_tokens = maximum;
+    } else {
+        elapsed = now >= limiter->last_refill_ms ? now - limiter->last_refill_ms : 0;
+        refill = elapsed > maximum / rate ? maximum : elapsed * rate;
+        if (limiter->scaled_tokens > maximum - refill)
+            limiter->scaled_tokens = maximum;
+        else
+            limiter->scaled_tokens += refill;
+        limiter->last_refill_ms = now;
+    }
+    if (limiter->scaled_tokens < UINT64_C(1000))
+        return false;
+    limiter->scaled_tokens -= UINT64_C(1000);
+    return true;
+}
+
 static void handle_signal(int signal_number)
 {
     (void)signal_number;
@@ -284,7 +356,7 @@ static bool address_equal(const struct sockaddr_in *left, const struct sockaddr_
            left->sin_addr.s_addr == right->sin_addr.s_addr;
 }
 
-static bool parse_port(const char *text, uint16_t *port)
+static bool parse_port(const char *text, bool allow_zero, uint16_t *port)
 {
     char *end = NULL;
     unsigned long value;
@@ -293,7 +365,7 @@ static bool parse_port(const char *text, uint16_t *port)
         return false;
     errno = 0;
     value = strtoul(text, &end, 10);
-    if (errno || !end || *end || value == 0 || value > UINT16_MAX)
+    if (errno || !end || *end || (!allow_zero && value == 0) || value > UINT16_MAX)
         return false;
     *port = (uint16_t)value;
     return true;
@@ -325,7 +397,7 @@ static bool resolve_endpoint(const char *text, const char *default_host, uint16_
             return false;
         }
         *colon++ = 0;
-        if (!parse_port(colon, &port)) {
+        if (!parse_port(colon, passive, &port)) {
             fprintf(stderr, "Invalid UDP port in endpoint: %s\n", text);
             return false;
         }
@@ -363,6 +435,33 @@ static bool resolve_endpoint(const char *text, const char *default_host, uint16_
     return true;
 }
 
+static bool normalize_advertise(const char *text, uint16_t default_port, char *output,
+                                size_t capacity)
+{
+    const char *colon;
+    size_t i;
+    int written;
+
+    if (!text || !*text)
+        return false;
+    for (i = 0; text[i]; ++i) {
+        if ((unsigned char)text[i] <= 32)
+            return false;
+    }
+    colon = strrchr(text, ':');
+    if (colon) {
+        uint16_t ignored_port;
+
+        if (colon == text || strchr(text, ':') != colon || !parse_port(colon + 1, false,
+                                                                       &ignored_port))
+            return false;
+        written = snprintf(output, capacity, "%s", text);
+    } else {
+        written = snprintf(output, capacity, "%s:%u", text, (unsigned int)default_port);
+    }
+    return written >= 0 && (size_t)written < capacity;
+}
+
 static bool set_close_on_exec(int descriptor)
 {
 #ifdef _WIN32
@@ -396,15 +495,23 @@ static bool configure_socket(proxy_socket descriptor)
 static proxy_socket open_listen_socket(const struct sockaddr_in *address, uint16_t *bound_port)
 {
     proxy_socket descriptor;
-    int enabled = 1;
     struct sockaddr_in actual;
     proxy_socklen actual_length = (proxy_socklen)sizeof(actual);
 
     descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (descriptor == PROXY_INVALID_SOCKET)
         return PROXY_INVALID_SOCKET;
-    (void)setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, (const char *)&enabled,
-                     (proxy_socklen)sizeof(enabled));
+#ifdef _WIN32
+    {
+        int enabled = 1;
+
+        if (setsockopt(descriptor, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&enabled,
+                       (proxy_socklen)sizeof(enabled)) != 0) {
+            close_socket(descriptor);
+            return PROXY_INVALID_SOCKET;
+        }
+    }
+#endif
     if (!configure_socket(descriptor) ||
         bind(descriptor, (const struct sockaddr *)address, (proxy_socklen)sizeof(*address)) != 0 ||
         getsockname(descriptor, (struct sockaddr *)&actual, &actual_length) != 0) {
@@ -415,13 +522,14 @@ static proxy_socket open_listen_socket(const struct sockaddr_in *address, uint16
     return descriptor;
 }
 
-static proxy_socket open_upstream_socket(void)
+static proxy_socket open_upstream_socket(const struct sockaddr_in *server)
 {
     proxy_socket descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
     if (descriptor == PROXY_INVALID_SOCKET)
         return PROXY_INVALID_SOCKET;
-    if (!configure_socket(descriptor)) {
+    if (!configure_socket(descriptor) ||
+        connect(descriptor, (const struct sockaddr *)server, (proxy_socklen)sizeof(*server)) != 0) {
         close_socket(descriptor);
         return PROXY_INVALID_SOCKET;
     }
@@ -448,6 +556,28 @@ static bool send_datagram(proxy_socket descriptor, const uint8_t *data, size_t l
     return sent >= 0 && (size_t)sent == length;
 }
 
+static bool send_upstream(proxy_socket descriptor, const uint8_t *data, size_t length)
+{
+    proxy_io_size sent;
+
+    if (length > INT_MAX)
+        return false;
+    do {
+#ifdef _WIN32
+        sent = send(descriptor, (const char *)data, (int)length, 0);
+#else
+        sent = send(descriptor, data, length, 0);
+#endif
+    } while (sent < 0 && socket_interrupted());
+    return sent >= 0 && (size_t)sent == length;
+}
+
+static bool connect_upstream(proxy_socket descriptor, const struct sockaddr_in *server)
+{
+    return connect(descriptor, (const struct sockaddr *)server,
+                   (proxy_socklen)sizeof(*server)) == 0;
+}
+
 static bool local_time_value(time_t value, struct tm *result)
 {
 #ifdef _WIN32
@@ -462,7 +592,7 @@ static int make_directory(const char *path)
 #ifdef _WIN32
     return _mkdir(path);
 #else
-    return mkdir(path, 0755);
+    return mkdir(path, 0700);
 #endif
 }
 
@@ -493,22 +623,68 @@ static int delete_file(const char *path)
 #endif
 }
 
-static bool ensure_record_directory(const char *path)
+static bool ensure_one_directory(const char *path)
 {
     struct stat information;
+    int status;
 
-    if (!*path)
-        return true;
-    if (stat(path, &information) == 0) {
-        if (S_ISDIR(information.st_mode)) {
-            return true;
+#ifdef _WIN32
+    status = stat(path, &information);
+#else
+    status = lstat(path, &information);
+#endif
+    if (status == 0) {
+#ifndef _WIN32
+        if (S_ISLNK(information.st_mode)) {
+            errno = ELOOP;
+            return false;
         }
+#endif
+        if (S_ISDIR(information.st_mode))
+            return true;
         errno = ENOTDIR;
         return false;
     }
     if (errno != ENOENT)
         return false;
     return make_directory(path) == 0;
+}
+
+static bool ensure_record_directory(const char *path)
+{
+    char copy[PATH_MAX];
+    char *cursor;
+
+    if (!*path)
+        return true;
+    if (strlen(path) >= sizeof(copy)) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    memcpy(copy, path, strlen(path) + 1);
+    cursor = copy;
+#ifdef _WIN32
+    if (copy[0] && copy[1] == ':')
+        cursor = copy + 2;
+#else
+    if (copy[0] == '/')
+        cursor = copy + 1;
+#endif
+    for (; *cursor; ++cursor) {
+        bool separator = *cursor == '/';
+#ifdef _WIN32
+        separator = separator || *cursor == '\\';
+#endif
+        if (separator && cursor > copy && cursor[-1] != ':') {
+            char saved = *cursor;
+
+            *cursor = 0;
+            if (!ensure_one_directory(copy))
+                return false;
+            *cursor = saved;
+        }
+    }
+    return ensure_one_directory(copy);
 }
 
 static bool demo_write_message(session *connection, const uint8_t *message, size_t length)
@@ -520,6 +696,15 @@ static bool demo_write_message(session *connection, const uint8_t *message, size
         return true;
     if (length > INT32_MAX)
         return false;
+    if (connection->demo_limit_bytes) {
+        uint64_t record_bytes = (uint64_t)sizeof(header) + (uint64_t)length;
+
+        if (record_bytes > connection->demo_limit_bytes ||
+            connection->demo_bytes > connection->demo_limit_bytes - record_bytes) {
+            connection->demo_limit_hit = true;
+            return false;
+        }
+    }
     nq_write_le32(header, (uint32_t)length);
     for (i = 0; i < 3; ++i) {
         uint32_t bits;
@@ -529,6 +714,7 @@ static bool demo_write_message(session *connection, const uint8_t *message, size
     if (fwrite(header, 1, sizeof(header), connection->demo) != sizeof(header) ||
         fwrite(message, 1, length, connection->demo) != length)
         return false;
+    connection->demo_bytes += sizeof(header) + length;
     return true;
 }
 
@@ -617,17 +803,22 @@ static void open_demo(app *proxy, session *connection)
         connection->demo_path[0] = 0;
         return;
     }
+    connection->demo_bytes = 3;
+    connection->demo_limit_bytes = proxy->cfg.max_demo_bytes;
     app_log(proxy, 0, "session %lu: recording %s\n", connection->id, connection->demo_path);
 }
 
 static void close_session(app *proxy, int index, const char *reason)
 {
     session *connection = &proxy->sessions[index];
+    int log_level;
 
     if (connection->state == SESSION_FREE)
         return;
-    app_log(proxy, 0,
-            "session %lu: closed (%s), client %llu/%llu packets, server %llu/%llu packets\n",
+    log_level = connection->state == SESSION_QUERY ? 1 : 0;
+    app_log(proxy, log_level,
+            "session %lu: closed (%s), client %llu packets/%llu bytes, "
+            "server %llu packets/%llu bytes\n",
             connection->id, reason, (unsigned long long)connection->packets_from_client,
             (unsigned long long)connection->bytes_from_client,
             (unsigned long long)connection->packets_from_server,
@@ -663,20 +854,20 @@ static int allocate_session(app *proxy, const struct sockaddr_in *client, sessio
             continue;
         connection = &proxy->sessions[i];
         memset(connection, 0, sizeof(*connection));
-        connection->upstream_fd = open_upstream_socket();
+        connection->upstream_fd = open_upstream_socket(&proxy->cfg.target_address);
         if (connection->upstream_fd == PROXY_INVALID_SOCKET)
             return -1;
         connection->state = state;
         connection->client = *client;
         connection->server = proxy->cfg.target_address;
         connection->id = ++proxy->next_session_id;
-        connection->last_activity_ms = monotonic_milliseconds();
+        connection->last_client_activity_ms = monotonic_milliseconds();
         return i;
     }
     return -1;
 }
 
-static void restart_session(app *proxy, int index, bool proquake_requested)
+static bool restart_session(app *proxy, int index, bool proquake_requested)
 {
     session *connection = &proxy->sessions[index];
     proxy_socket upstream_fd = connection->upstream_fd;
@@ -686,22 +877,87 @@ static void restart_session(app *proxy, int index, bool proquake_requested)
     if (!close_demo(connection))
         app_log(proxy, 0, "session %lu: warning: demo write failed during reconnect\n",
                 previous_id);
+    if (!connect_upstream(upstream_fd, &proxy->cfg.target_address)) {
+        close_session(proxy, index, "cannot reconnect upstream control port");
+        return false;
+    }
     memset(connection, 0, sizeof(*connection));
     connection->state = SESSION_CONNECTING;
     connection->upstream_fd = upstream_fd;
     connection->id = ++proxy->next_session_id;
     connection->client = client;
     connection->server = proxy->cfg.target_address;
-    connection->last_activity_ms = monotonic_milliseconds();
+    connection->last_client_activity_ms = monotonic_milliseconds();
     connection->proquake_requested = proquake_requested;
     app_log(proxy, 0, "session %lu: reconnecting as session %lu with the same upstream port\n",
             previous_id, connection->id);
+    return true;
 }
 
-static bool is_query_command(uint8_t command)
+static bool query_command_allowed(const app *proxy, uint8_t command)
 {
-    return command == NQ_CCREQ_SERVER_INFO || command == NQ_CCREQ_PLAYER_INFO ||
-           command == NQ_CCREQ_RULE_INFO || command == NQ_CCREQ_RCON;
+    if (command == NQ_CCREQ_SERVER_INFO)
+        return proxy->cfg.advertise[0] != 0;
+    if (command == NQ_CCREQ_PLAYER_INFO)
+        return proxy->cfg.allow_player_info;
+    if (command == NQ_CCREQ_RULE_INFO)
+        return true;
+    return command == NQ_CCREQ_RCON && proxy->cfg.allow_rcon;
+}
+
+static bool valid_query_request(const app *proxy, const uint8_t *data, size_t length,
+                                const nq_packet_view *view)
+{
+    const uint8_t *terminator;
+
+    if (length > FAQPROXY_MAX_CONTROL_PACKET || !query_command_allowed(proxy, view->command))
+        return false;
+    if (view->command == NQ_CCREQ_SERVER_INFO) {
+        static const uint8_t payload[] = {'Q', 'U', 'A', 'K', 'E', 0,
+                                          NQ_NET_PROTOCOL_VERSION};
+
+        return view->payload_length == sizeof(payload) &&
+               memcmp(data + view->payload_offset, payload, sizeof(payload)) == 0;
+    }
+    if (view->command == NQ_CCREQ_PLAYER_INFO)
+        return view->payload_length == 1;
+    if (view->command == NQ_CCREQ_RULE_INFO) {
+        terminator = memchr(data + view->payload_offset, 0, view->payload_length);
+        return terminator && terminator == data + length - 1;
+    }
+    if (view->command == NQ_CCREQ_RCON) {
+        const uint8_t *password_end =
+            memchr(data + view->payload_offset, 0, view->payload_length);
+
+        if (!password_end || password_end == data + length - 1)
+            return false;
+        terminator = memchr(password_end + 1, 0, (size_t)(data + length - password_end - 1));
+        return terminator && terminator == data + length - 1;
+    }
+    return false;
+}
+
+static int query_session_count(const app *proxy)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < proxy->cfg.max_sessions; ++i) {
+        if (proxy->sessions[i].state == SESSION_QUERY)
+            ++count;
+    }
+    return count;
+}
+
+static int query_session_limit(const app *proxy)
+{
+    int limit = proxy->cfg.max_sessions / 4;
+
+    if (limit < 1)
+        limit = 1;
+    if (limit > FAQPROXY_MAX_QUERY_SESSIONS)
+        limit = FAQPROXY_MAX_QUERY_SESSIONS;
+    return limit;
 }
 
 static void reject_client(app *proxy, const struct sockaddr_in *client, const char *reason)
@@ -709,7 +965,8 @@ static void reject_client(app *proxy, const struct sockaddr_in *client, const ch
     uint8_t response[512];
     size_t length = nq_make_reject(response, sizeof(response), reason);
 
-    if (length)
+    if (length && rate_limiter_allow(&proxy->reject_limiter, FAQPROXY_REJECT_RATE,
+                                     FAQPROXY_REJECT_BURST))
         (void)send_datagram(proxy->listen_fd, response, length, client);
 }
 
@@ -767,16 +1024,22 @@ static void inspect_client_message(session *connection, const uint8_t *message, 
 
         if (command == 0)
             return;
-        if (command == 1)
+        if (command == NQ_CLC_NOP)
             continue;
-        if (command == 2)
+        if (command == NQ_CLC_DISCONNECT)
             return;
-        if (command == 4) {
+        if (command == NQ_CLC_ACKFRAME) {
+            if (offset + 4 > length)
+                return;
+            offset += 4;
+            continue;
+        }
+        if (command == NQ_CLC_STRINGCMD) {
             while (offset < length && message[offset++] != 0)
                 ;
             continue;
         }
-        if (command == 3) {
+        if (command == NQ_CLC_MOVE) {
             int i;
             size_t angle_bytes;
 
@@ -820,8 +1083,12 @@ static void inspect_complete_message(app *proxy, session *connection, bool from_
     if (from_server) {
         detect_protocol(proxy, connection, message, length);
         if (!demo_write_message(connection, message, length)) {
-            app_log(proxy, 0, "session %lu: demo write failed; recording stopped\n",
-                    connection->id);
+            if (connection->demo_limit_hit)
+                app_log(proxy, 0, "session %lu: demo size limit reached; recording stopped\n",
+                        connection->id);
+            else
+                app_log(proxy, 0, "session %lu: demo write failed; recording stopped\n",
+                        connection->id);
             (void)close_demo(connection);
         }
     } else {
@@ -838,6 +1105,15 @@ static void inspect_connected_packet(app *proxy, session *connection, bool from_
     if (!nq_parse_packet(data, length, &view) || view.control)
         return;
     if (view.flags & NQ_NETFLAG_UNRELIABLE) {
+        uint32_t *next_sequence = from_server ? &connection->server_unreliable_sequence
+                                              : &connection->client_unreliable_sequence;
+        bool *have_sequence = from_server ? &connection->have_server_unreliable_sequence
+                                          : &connection->have_client_unreliable_sequence;
+
+        if (*have_sequence && view.sequence < *next_sequence)
+            return;
+        *next_sequence = view.sequence + 1;
+        *have_sequence = true;
         inspect_complete_message(proxy, connection, from_server, data + view.payload_offset,
                                  view.payload_length);
         return;
@@ -885,24 +1161,35 @@ static void begin_connect(app *proxy, const struct sockaddr_in *client, const ui
     if (index >= 0) {
         connection = &proxy->sessions[index];
         if (connection->state == SESSION_CONNECTING) {
-            if (send_datagram(connection->upstream_fd, data, length, &connection->server)) {
+            if (send_upstream(connection->upstream_fd, data, length)) {
                 connection->packets_from_client++;
                 connection->bytes_from_client += length;
             } else {
                 app_log(proxy, 1, "session %lu: retry send failed: %s\n", connection->id,
                         socket_error_string());
             }
-            connection->last_activity_ms = now;
+            connection->last_client_activity_ms = now;
             return;
         }
+        if (connection->state == SESSION_ESTABLISHED && connection->cached_accept_length &&
+            connection->accepted_at_ms &&
+            now - connection->accepted_at_ms < FAQPROXY_DUPLICATE_CONNECT_MS) {
+            (void)send_datagram(proxy->listen_fd, connection->cached_accept,
+                                connection->cached_accept_length, &connection->client);
+            connection->last_client_activity_ms = now;
+            return;
+        }
+    }
+
+    if (!rate_limiter_allow(&proxy->connect_limiter, proxy->cfg.connect_rate,
+                            proxy->cfg.connect_rate * 2))
+        return;
+
+    if (index >= 0) {
+        connection = &proxy->sessions[index];
         if (connection->state == SESSION_ESTABLISHED && connection->cached_accept_length) {
-            if (connection->accepted_at_ms &&
-                now - connection->accepted_at_ms < FAQPROXY_DUPLICATE_CONNECT_MS) {
-                (void)send_datagram(proxy->listen_fd, connection->cached_accept,
-                                    connection->cached_accept_length, &connection->client);
-                return;
-            }
-            restart_session(proxy, index, proquake_requested);
+            if (!restart_session(proxy, index, proquake_requested))
+                index = -1;
         } else {
             close_session(proxy, index, "new connection request");
             index = -1;
@@ -917,7 +1204,7 @@ static void begin_connect(app *proxy, const struct sockaddr_in *client, const ui
     }
     connection = &proxy->sessions[index];
     connection->proquake_requested = proquake_requested;
-    if (!send_datagram(connection->upstream_fd, data, length, &connection->server)) {
+    if (!send_upstream(connection->upstream_fd, data, length)) {
         reject_client(proxy, client, "FAQProxy could not reach the server.\n");
         close_session(proxy, index, "upstream send failed");
         return;
@@ -930,25 +1217,34 @@ static void begin_connect(app *proxy, const struct sockaddr_in *client, const ui
 }
 
 static void begin_query(app *proxy, const struct sockaddr_in *client, const uint8_t *data,
-                        size_t length)
+                        size_t length, uint8_t command)
 {
     int index = find_session(proxy, client);
     session *connection;
 
     if (index >= 0 && proxy->sessions[index].state != SESSION_QUERY)
         return;
+    if (index >= 0 && proxy->sessions[index].query_command != command)
+        return;
+    if (!rate_limiter_allow(&proxy->query_limiter, proxy->cfg.query_rate,
+                            proxy->cfg.query_rate * 2))
+        return;
+    if (index < 0 && query_session_count(proxy) >= query_session_limit(proxy))
+        return;
     if (index < 0)
         index = allocate_session(proxy, client, SESSION_QUERY);
     if (index < 0)
         return;
     connection = &proxy->sessions[index];
-    if (send_datagram(connection->upstream_fd, data, length, &connection->server)) {
-        connection->last_activity_ms = monotonic_milliseconds();
+    connection->query_command = command;
+    if (send_upstream(connection->upstream_fd, data, length)) {
+        connection->last_client_activity_ms = monotonic_milliseconds();
         connection->packets_from_client++;
         connection->bytes_from_client += length;
     } else {
         app_log(proxy, 1, "session %lu: control query send failed: %s\n", connection->id,
                 socket_error_string());
+        close_session(proxy, index, "control query send failed");
     }
 }
 
@@ -957,26 +1253,38 @@ static void handle_client_datagram(app *proxy, const uint8_t *data, size_t lengt
 {
     nq_packet_view view;
     bool proquake_requested = false;
+    bool parsed;
+    bool confirms_client;
     int index;
     session *connection;
 
+    parsed = nq_parse_packet(data, length, &view);
+    if (parsed && view.control && length > FAQPROXY_MAX_CONTROL_PACKET) {
+        app_log(proxy, 1, "ignored oversized control request (%llu bytes)\n",
+                (unsigned long long)length);
+        return;
+    }
     if (nq_is_connect_request(data, length, &proquake_requested)) {
         begin_connect(proxy, client, data, length, proquake_requested);
         return;
     }
 
-    if (nq_parse_packet(data, length, &view) && view.control) {
+    if (parsed && view.control) {
         if (view.command == NQ_CCREQ_CONNECT) {
-            reject_client(proxy, client, "Incompatible NetQuake connection request.\n");
+            if (length >= 12)
+                reject_client(proxy, client, "Incompatible NetQuake connection request.\n");
             return;
         }
-        if (!is_query_command(view.command)) {
+        if (!valid_query_request(proxy, data, length, &view)) {
             app_log(proxy, 1, "ignored unsupported control request 0x%02x\n", view.command);
             return;
         }
-        begin_query(proxy, client, data, length);
+        begin_query(proxy, client, data, length, view.command);
         return;
     }
+
+    if (!parsed)
+        return;
 
     index = find_session(proxy, client);
     if (index < 0)
@@ -984,8 +1292,13 @@ static void handle_client_datagram(app *proxy, const uint8_t *data, size_t lengt
     connection = &proxy->sessions[index];
     if (connection->state != SESSION_ESTABLISHED)
         return;
-    if (send_datagram(connection->upstream_fd, data, length, &connection->server)) {
-        connection->last_activity_ms = monotonic_milliseconds();
+    confirms_client = (view.flags & NQ_NETFLAG_ACK) != 0 &&
+                      connection->server_reliable.have_sequence &&
+                      view.sequence == connection->server_reliable.last_sequence;
+    if (send_upstream(connection->upstream_fd, data, length)) {
+        connection->last_client_activity_ms = monotonic_milliseconds();
+        if (confirms_client)
+            connection->client_confirmed = true;
         connection->packets_from_client++;
         connection->bytes_from_client += length;
         inspect_connected_packet(proxy, connection, false, data, length);
@@ -1000,8 +1313,9 @@ static void handle_client_datagram(app *proxy, const uint8_t *data, size_t lengt
 static void drain_client_socket(app *proxy)
 {
     uint8_t data[FAQPROXY_PACKET_SIZE];
+    unsigned int processed;
 
-    for (;;) {
+    for (processed = 0; processed < FAQPROXY_MAX_DATAGRAMS_PER_TICK; ++processed) {
         struct sockaddr_in client;
         proxy_socklen client_length = (proxy_socklen)sizeof(client);
 #ifdef _WIN32
@@ -1034,8 +1348,17 @@ static bool accept_upstream_connection(app *proxy, session *connection, const ui
     if (!nq_accept_port(data, length, &accepted_port))
         return false;
     ignore_port = length >= 12 && data[9] == 1 && (data[11] & NQ_PQF_IGNOREPORT) != 0;
-    if (accepted_port && !ignore_port)
-        connection->server.sin_port = htons(accepted_port);
+    if (accepted_port && !ignore_port) {
+        struct sockaddr_in accepted_server = connection->server;
+
+        accepted_server.sin_port = htons(accepted_port);
+        if (!connect_upstream(connection->upstream_fd, &accepted_server)) {
+            app_log(proxy, 0, "session %lu: cannot switch to upstream UDP port %u: %s\n",
+                    connection->id, (unsigned int)accepted_port, socket_error_string());
+            return false;
+        }
+        connection->server = accepted_server;
+    }
 
     rewritten_length =
         nq_rewrite_accept(rewritten, sizeof(rewritten), data, length, proxy->listen_port);
@@ -1050,30 +1373,71 @@ static bool accept_upstream_connection(app *proxy, session *connection, const ui
     connection->cached_accept_length = rewritten_length;
     connection->proquake_angles = connection->proquake_requested && length >= 10 && data[9] == 1;
     connection->state = SESSION_ESTABLISHED;
-    connection->last_activity_ms = monotonic_milliseconds();
-    connection->accepted_at_ms = connection->last_activity_ms;
+    connection->accepted_at_ms = monotonic_milliseconds();
     open_demo(proxy, connection);
     app_log(proxy, 0, "session %lu: upstream accepted on UDP port %u\n", connection->id,
             (unsigned int)ntohs(connection->server.sin_port));
     return true;
 }
 
+static uint8_t expected_query_reply(uint8_t request)
+{
+    switch (request) {
+    case NQ_CCREQ_SERVER_INFO:
+        return NQ_CCREP_SERVER_INFO;
+    case NQ_CCREQ_PLAYER_INFO:
+        return NQ_CCREP_PLAYER_INFO;
+    case NQ_CCREQ_RULE_INFO:
+        return NQ_CCREP_RULE_INFO;
+    case NQ_CCREQ_RCON:
+        return NQ_CCREP_RCON;
+    default:
+        return 0;
+    }
+}
+
+static size_t rewrite_server_info(const app *proxy, uint8_t *output, size_t capacity,
+                                  const uint8_t *input, size_t input_length)
+{
+    nq_packet_view view;
+    const uint8_t *terminator;
+    size_t old_address_length;
+    size_t new_address_length;
+    size_t suffix_length;
+    size_t output_length;
+
+    if (!nq_parse_packet(input, input_length, &view) || !view.control ||
+        view.command != NQ_CCREP_SERVER_INFO)
+        return 0;
+    terminator = memchr(input + view.payload_offset, 0, view.payload_length);
+    if (!terminator)
+        return 0;
+    old_address_length = (size_t)(terminator - (input + view.payload_offset)) + 1;
+    new_address_length = strlen(proxy->cfg.advertise) + 1;
+    suffix_length = view.payload_length - old_address_length;
+    output_length = view.payload_offset + new_address_length + suffix_length;
+    if (output_length > capacity || output_length > NQ_NETFLAG_LENGTH_MASK)
+        return 0;
+    nq_write_be32(output, NQ_NETFLAG_CTL | (uint32_t)output_length);
+    output[4] = NQ_CCREP_SERVER_INFO;
+    memcpy(output + view.payload_offset, proxy->cfg.advertise, new_address_length);
+    memcpy(output + view.payload_offset + new_address_length, terminator + 1, suffix_length);
+    return output_length;
+}
+
 static void drain_upstream_socket(app *proxy, int index, proxy_socket expected_fd)
 {
     uint8_t data[FAQPROXY_PACKET_SIZE];
     session *connection = &proxy->sessions[index];
+    unsigned int processed;
 
     if (connection->state == SESSION_FREE || connection->upstream_fd != expected_fd)
         return;
-    for (;;) {
-        struct sockaddr_in source;
-        proxy_socklen source_length = (proxy_socklen)sizeof(source);
+    for (processed = 0; processed < FAQPROXY_MAX_DATAGRAMS_PER_TICK; ++processed) {
 #ifdef _WIN32
-        proxy_io_size received = recvfrom(expected_fd, (char *)data, (int)sizeof(data), 0,
-                                          (struct sockaddr *)&source, &source_length);
+        proxy_io_size received = recv(expected_fd, (char *)data, (int)sizeof(data), 0);
 #else
-        proxy_io_size received = recvfrom(expected_fd, data, sizeof(data), 0,
-                                          (struct sockaddr *)&source, &source_length);
+        proxy_io_size received = recv(expected_fd, data, sizeof(data), 0);
 #endif
         nq_packet_view view;
 
@@ -1084,24 +1448,19 @@ static void drain_upstream_socket(app *proxy, int index, proxy_socket expected_f
                 close_session(proxy, index, "upstream receive failed");
             return;
         }
-        if (source_length != (proxy_socklen)sizeof(source) ||
-            !address_equal(&source, &connection->server)) {
-            char source_text[64];
-
-            app_log(proxy, 1, "session %lu: ignored upstream packet from %s\n", connection->id,
-                    source_length == (proxy_socklen)sizeof(source)
-                        ? format_address(&source, source_text, sizeof(source_text))
-                        : "an invalid address");
-            continue;
-        }
-
-        connection->last_activity_ms = monotonic_milliseconds();
         connection->packets_from_server++;
         connection->bytes_from_server += (uint64_t)received;
 
         if (connection->state == SESSION_CONNECTING &&
             nq_parse_packet(data, (size_t)received, &view) && view.control) {
             if (view.command == NQ_CCREP_ACCEPT) {
+                if ((size_t)received >= 12 && data[9] == 1 &&
+                    (data[11] & NQ_PQF_CHEATFREE) != 0) {
+                    reject_client(proxy, &connection->client,
+                                  "ProQuake cheat-free is incompatible with a UDP relay.\n");
+                    close_session(proxy, index, "unsupported ProQuake cheat-free handshake");
+                    return;
+                }
                 if (!accept_upstream_connection(proxy, connection, data, (size_t)received)) {
                     reject_client(proxy, &connection->client,
                                   "FAQProxy received a malformed server acceptance.\n");
@@ -1112,7 +1471,14 @@ static void drain_upstream_socket(app *proxy, int index, proxy_socket expected_f
                 continue;
             }
             if (view.command == NQ_CCREP_REJECT) {
-                (void)send_datagram(proxy->listen_fd, data, (size_t)received, &connection->client);
+                if ((size_t)received > sizeof(connection->cached_accept)) {
+                    close_session(proxy, index, "oversized upstream rejection");
+                    return;
+                }
+                if (rate_limiter_allow(&proxy->reject_limiter, FAQPROXY_REJECT_RATE,
+                                       FAQPROXY_REJECT_BURST))
+                    (void)send_datagram(proxy->listen_fd, data, (size_t)received,
+                                        &connection->client);
                 close_session(proxy, index, "upstream rejected connection");
                 return;
             }
@@ -1124,6 +1490,54 @@ static void drain_upstream_socket(app *proxy, int index, proxy_socket expected_f
             app_log(proxy, 1, "session %lu: ignored non-control data before acceptance\n",
                     connection->id);
             continue;
+        }
+
+        if (connection->state == SESSION_QUERY) {
+            uint8_t rewritten[FAQPROXY_MAX_CONTROL_PACKET + sizeof(proxy->cfg.advertise)];
+            const uint8_t *reply = data;
+            size_t reply_length = (size_t)received;
+
+            if (reply_length > FAQPROXY_MAX_CONTROL_PACKET ||
+                !nq_parse_packet(data, reply_length, &view) || !view.control ||
+                view.command != expected_query_reply(connection->query_command)) {
+                app_log(proxy, 1, "session %lu: ignored malformed control reply\n",
+                        connection->id);
+                continue;
+            }
+            if (view.command == NQ_CCREP_SERVER_INFO) {
+                reply_length = rewrite_server_info(proxy, rewritten, sizeof(rewritten), data,
+                                                   reply_length);
+                if (!reply_length) {
+                    close_session(proxy, index, "malformed server-info reply");
+                    return;
+                }
+                reply = rewritten;
+            }
+            (void)send_datagram(proxy->listen_fd, reply, reply_length, &connection->client);
+            if (connection->query_command != NQ_CCREQ_RCON) {
+                close_session(proxy, index, "control query complete");
+                return;
+            }
+            continue;
+        }
+
+        if (connection->state == SESSION_ESTABLISHED) {
+            if (!nq_parse_packet(data, (size_t)received, &view) || view.control) {
+                app_log(proxy, 1, "session %lu: ignored malformed connected server packet\n",
+                        connection->id);
+                continue;
+            }
+            if (!connection->client_confirmed) {
+                if (connection->unconfirmed_packets_from_server >=
+                        FAQPROXY_UNCONFIRMED_MAX_PACKETS ||
+                    (uint64_t)received > FAQPROXY_UNCONFIRMED_MAX_BYTES -
+                                             connection->unconfirmed_bytes_from_server) {
+                    close_session(proxy, index, "unconfirmed relay limit");
+                    return;
+                }
+                connection->unconfirmed_packets_from_server++;
+                connection->unconfirmed_bytes_from_server += (uint64_t)received;
+            }
         }
 
         if (!send_datagram(proxy->listen_fd, data, (size_t)received, &connection->client)) {
@@ -1154,9 +1568,14 @@ static void expire_sessions(app *proxy)
             limit = FAQPROXY_CONNECT_TIMEOUT_MS;
         else if (connection->state == SESSION_QUERY)
             limit = FAQPROXY_QUERY_TIMEOUT_MS;
+        else if (!connection->client_confirmed) {
+            limit = FAQPROXY_CONFIRM_TIMEOUT_MS;
+            if (idle_limit && idle_limit < limit)
+                limit = idle_limit;
+        }
         else
             limit = idle_limit;
-        if (limit && now - connection->last_activity_ms > limit)
+        if (limit && now - connection->last_client_activity_ms > limit)
             close_session(proxy, i, "idle timeout");
     }
 }
@@ -1231,9 +1650,17 @@ static void print_usage(FILE *output, const char *program)
             "\n"
             "Options:\n"
             "  -l, --listen ADDRESS[:PORT]  listen endpoint (default 0.0.0.0:26000)\n"
+            "  -a, --advertise ADDRESS[:PORT] address placed in server-browser replies\n"
             "  -r, --record-dir DIRECTORY   record each connection as a NetQuake .dem\n"
             "  -m, --max-clients NUMBER     simultaneous sessions, 1-64 (default 32)\n"
-            "  -t, --timeout SECONDS        established idle timeout (default 120)\n"
+            "  -t, --timeout SECONDS        client-idle timeout; 0 disables (default 120)\n"
+            "      --connect-rate NUMBER    new connections per second; 0 disables limit "
+            "(default 16)\n"
+            "      --query-rate NUMBER      control queries per second; 0 disables limit "
+            "(default 32)\n"
+            "      --max-demo-mib NUMBER    per-demo size limit; 0 disables (default 1024)\n"
+            "      --allow-player-info      relay queries that may expose player addresses\n"
+            "      --allow-rcon             relay plaintext RCON queries (unsafe)\n"
             "  -v, --verbose                verbose logging; repeat for every datagram\n"
             "      --version                print version\n"
             "  -h, --help                   show this help\n",
@@ -1246,9 +1673,11 @@ static bool parse_unsigned(const char *text, unsigned int minimum, unsigned int 
     char *end = NULL;
     unsigned long value;
 
+    if (!text || !*text)
+        return false;
     errno = 0;
     value = strtoul(text, &end, 10);
-    if (errno || !end || *end || value < minimum || value > maximum)
+    if (errno || !end || end == text || *end || value < minimum || value > maximum)
         return false;
     *result = (unsigned int)value;
     return true;
@@ -1278,6 +1707,7 @@ static bool match_long_option(const char *argument, const char *name, const char
 
 static command_line_result parse_command_line(app *proxy, int argc, char **argv,
                                               const char **listen_argument,
+                                              const char **advertise_argument,
                                               const char **server_argument)
 {
     int index = 1;
@@ -1301,16 +1731,28 @@ static command_line_result parse_command_line(app *proxy, int argc, char **argv,
                 option = 1000;
             else if (strcmp(argument, "--verbose") == 0)
                 option = 'v';
+            else if (strcmp(argument, "--allow-player-info") == 0)
+                option = 1001;
+            else if (strcmp(argument, "--allow-rcon") == 0)
+                option = 1002;
             else if (match_long_option(argument, "--listen", &value))
                 option = 'l';
+            else if (match_long_option(argument, "--advertise", &value))
+                option = 'a';
             else if (match_long_option(argument, "--record-dir", &value))
                 option = 'r';
             else if (match_long_option(argument, "--max-clients", &value))
                 option = 'm';
             else if (match_long_option(argument, "--timeout", &value))
                 option = 't';
-        } else if (argument[1] == 'l' || argument[1] == 'r' || argument[1] == 'm' ||
-                   argument[1] == 't') {
+            else if (match_long_option(argument, "--max-demo-mib", &value))
+                option = 1003;
+            else if (match_long_option(argument, "--query-rate", &value))
+                option = 1004;
+            else if (match_long_option(argument, "--connect-rate", &value))
+                option = 1005;
+        } else if (argument[1] == 'l' || argument[1] == 'a' || argument[1] == 'r' ||
+                   argument[1] == 'm' || argument[1] == 't') {
             option = (unsigned char)argument[1];
             if (argument[2])
                 value = argument + 2;
@@ -1337,7 +1779,9 @@ static command_line_result parse_command_line(app *proxy, int argc, char **argv,
             print_usage(stderr, argv[0]);
             return COMMAND_LINE_EXIT_ERROR;
         }
-        if ((option == 'l' || option == 'r' || option == 'm' || option == 't') && !value) {
+        if ((option == 'l' || option == 'a' || option == 'r' || option == 'm' || option == 't' ||
+             option == 1003 || option == 1004 || option == 1005) &&
+            !value) {
             if (++index >= argc) {
                 fprintf(stderr, "Option %s requires a value\n", argument);
                 print_usage(stderr, argv[0]);
@@ -1350,7 +1794,14 @@ static command_line_result parse_command_line(app *proxy, int argc, char **argv,
         case 'l':
             *listen_argument = value;
             break;
+        case 'a':
+            *advertise_argument = value;
+            break;
         case 'r':
+            if (!*value) {
+                fprintf(stderr, "--record-dir must not be empty\n");
+                return COMMAND_LINE_EXIT_ERROR;
+            }
             if (strlen(value) >= sizeof(proxy->cfg.record_dir)) {
                 fprintf(stderr, "Record directory path is too long\n");
                 return COMMAND_LINE_EXIT_ERROR;
@@ -1374,6 +1825,33 @@ static command_line_result parse_command_line(app *proxy, int argc, char **argv,
         case 'v':
             if (proxy->cfg.verbose < 2)
                 ++proxy->cfg.verbose;
+            break;
+        case 1001:
+            proxy->cfg.allow_player_info = true;
+            break;
+        case 1002:
+            proxy->cfg.allow_rcon = true;
+            break;
+        case 1003:
+            if (!parse_unsigned(value, 0, 1048576, &parsed_value)) {
+                fprintf(stderr, "--max-demo-mib must be between 0 and 1048576\n");
+                return COMMAND_LINE_EXIT_ERROR;
+            }
+            proxy->cfg.max_demo_bytes = (uint64_t)parsed_value * UINT64_C(1024) * UINT64_C(1024);
+            break;
+        case 1004:
+            if (!parse_unsigned(value, 0, 10000, &parsed_value)) {
+                fprintf(stderr, "--query-rate must be between 0 and 10000\n");
+                return COMMAND_LINE_EXIT_ERROR;
+            }
+            proxy->cfg.query_rate = parsed_value;
+            break;
+        case 1005:
+            if (!parse_unsigned(value, 0, 10000, &parsed_value)) {
+                fprintf(stderr, "--connect-rate must be between 0 and 10000\n");
+                return COMMAND_LINE_EXIT_ERROR;
+            }
+            proxy->cfg.connect_rate = parsed_value;
             break;
         case 1000:
             printf("faqproxy %s\n", FAQPROXY_VERSION);
@@ -1399,6 +1877,7 @@ int main(int argc, char **argv)
 {
     app *proxy;
     const char *listen_argument = "0.0.0.0:26000";
+    const char *advertise_argument = NULL;
     const char *server_argument = NULL;
     command_line_result command_line;
     int exit_status;
@@ -1414,7 +1893,12 @@ int main(int argc, char **argv)
     proxy->listen_fd = PROXY_INVALID_SOCKET;
     proxy->cfg.max_sessions = 32;
     proxy->cfg.idle_timeout_seconds = 120;
-    command_line = parse_command_line(proxy, argc, argv, &listen_argument, &server_argument);
+    proxy->cfg.connect_rate = FAQPROXY_DEFAULT_CONNECT_RATE;
+    proxy->cfg.query_rate = FAQPROXY_DEFAULT_QUERY_RATE;
+    proxy->cfg.max_demo_bytes =
+        (uint64_t)FAQPROXY_DEFAULT_MAX_DEMO_MIB * UINT64_C(1024) * UINT64_C(1024);
+    command_line = parse_command_line(proxy, argc, argv, &listen_argument, &advertise_argument,
+                                      &server_argument);
     if (command_line != COMMAND_LINE_RUN) {
         free(proxy);
         return command_line == COMMAND_LINE_EXIT_OK ? 0 : 2;
@@ -1424,6 +1908,13 @@ int main(int argc, char **argv)
                           sizeof(proxy->cfg.listen_text)) ||
         !resolve_endpoint(server_argument, NULL, NQ_DEFAULT_PORT, false, &proxy->cfg.target_address,
                           proxy->cfg.target_text, sizeof(proxy->cfg.target_text))) {
+        free(proxy);
+        return 2;
+    }
+    if (advertise_argument &&
+        !normalize_advertise(advertise_argument, ntohs(proxy->cfg.listen_address.sin_port),
+                             proxy->cfg.advertise, sizeof(proxy->cfg.advertise))) {
+        fprintf(stderr, "Invalid --advertise address (use HOST[:PORT])\n");
         free(proxy);
         return 2;
     }
@@ -1442,6 +1933,16 @@ int main(int argc, char **argv)
         free(proxy);
         return 1;
     }
+    proxy->cfg.listen_address.sin_port = htons(proxy->listen_port);
+    format_address(&proxy->cfg.listen_address, proxy->cfg.listen_text,
+                   sizeof(proxy->cfg.listen_text));
+    if (advertise_argument)
+        (void)normalize_advertise(advertise_argument, proxy->listen_port, proxy->cfg.advertise,
+                                  sizeof(proxy->cfg.advertise));
+    if (!advertise_argument &&
+        proxy->cfg.listen_address.sin_addr.s_addr != htonl(INADDR_ANY))
+        format_address(&proxy->cfg.listen_address, proxy->cfg.advertise,
+                       sizeof(proxy->cfg.advertise));
     if (!install_signal_handlers()) {
         fprintf(stderr, "Cannot install signal handlers: %s\n", strerror(errno));
         close_socket(proxy->listen_fd);
@@ -1454,8 +1955,37 @@ int main(int argc, char **argv)
             "listening on %s, forwarding to %s, max clients %d\n",
             FAQPROXY_VERSION, proxy->cfg.listen_text, proxy->cfg.target_text,
             proxy->cfg.max_sessions);
-    if (proxy->cfg.record_dir[0])
-        fprintf(stderr, "recording demos in %s\n", proxy->cfg.record_dir);
+    if (proxy->cfg.record_dir[0]) {
+        if (proxy->cfg.max_demo_bytes)
+            fprintf(stderr, "recording demos in %s (limit %llu MiB each)\n",
+                    proxy->cfg.record_dir,
+                    (unsigned long long)(proxy->cfg.max_demo_bytes / UINT64_C(1024) /
+                                         UINT64_C(1024)));
+        else
+            fprintf(stderr, "recording demos in %s (no size limit)\n", proxy->cfg.record_dir);
+    }
+    if (proxy->cfg.advertise[0])
+        fprintf(stderr, "server-browser address: %s\n", proxy->cfg.advertise);
+    else
+        fprintf(stderr, "server-info queries disabled; use --advertise on a wildcard listener\n");
+    if (proxy->cfg.connect_rate)
+        fprintf(stderr, "connection rate: %u/second, burst %u\n", proxy->cfg.connect_rate,
+                proxy->cfg.connect_rate * 2);
+    else
+        fprintf(stderr, "warning: connection rate limit disabled\n");
+    if (proxy->cfg.query_rate)
+        fprintf(stderr, "control-query rate: %u/second, burst %u\n", proxy->cfg.query_rate,
+                proxy->cfg.query_rate * 2);
+    else
+        fprintf(stderr, "warning: control-query rate limit disabled\n");
+    if (proxy->cfg.allow_player_info)
+        fprintf(stderr, "warning: player-info query relay enabled\n");
+    if (proxy->cfg.allow_rcon)
+        fprintf(stderr, "warning: plaintext RCON query relay enabled\n");
+#ifndef _WIN32
+    if (geteuid() == 0)
+        fprintf(stderr, "warning: running as root; use a dedicated unprivileged account\n");
+#endif
 
     exit_status = run_proxy(proxy);
     for (i = 0; i < proxy->cfg.max_sessions; ++i)

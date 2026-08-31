@@ -38,6 +38,9 @@ bool nq_parse_packet(const uint8_t *data, size_t length, nq_packet_view *view)
     uint32_t header;
     uint32_t encoded_length;
     uint32_t flags;
+    uint32_t primary_flags;
+    const uint32_t known_flags = NQ_NETFLAG_DATA | NQ_NETFLAG_ACK | NQ_NETFLAG_NAK |
+                                 NQ_NETFLAG_EOM | NQ_NETFLAG_UNRELIABLE;
 
     if (!data || !view || length < 4)
         return false;
@@ -64,7 +67,15 @@ bool nq_parse_packet(const uint8_t *data, size_t length, nq_packet_view *view)
         return false;
     if (length < 8)
         return false;
-    if (!(flags & (NQ_NETFLAG_DATA | NQ_NETFLAG_ACK | NQ_NETFLAG_NAK | NQ_NETFLAG_UNRELIABLE)))
+    if (flags & ~known_flags)
+        return false;
+    primary_flags = flags & (NQ_NETFLAG_DATA | NQ_NETFLAG_ACK | NQ_NETFLAG_NAK |
+                             NQ_NETFLAG_UNRELIABLE);
+    if (!primary_flags || (primary_flags & (primary_flags - 1)) != 0)
+        return false;
+    if ((flags & NQ_NETFLAG_EOM) && primary_flags != NQ_NETFLAG_DATA)
+        return false;
+    if ((primary_flags == NQ_NETFLAG_ACK || primary_flags == NQ_NETFLAG_NAK) && length != 8)
         return false;
 
     view->sequence = nq_read_be32(data + 4);
@@ -181,48 +192,41 @@ const char *nq_protocol_name(int protocol)
 int nq_find_server_protocol(const uint8_t *message, size_t length, uint32_t *protocol_flags,
                             uint32_t *pext2_flags)
 {
-    size_t i;
+    size_t offset;
+    uint32_t value;
+    uint32_t candidate_pext2 = 0;
 
     if (protocol_flags)
         *protocol_flags = 0;
     if (pext2_flags)
         *pext2_flags = 0;
-    if (!message)
+    if (!message || length < 5 || message[0] != NQ_SVC_SERVERINFO)
         return 0;
 
-    for (i = 0; i + 5 <= length; ++i) {
-        size_t offset;
-        uint32_t value;
-        uint32_t candidate_pext2 = 0;
-
-        if (message[i] != NQ_SVC_SERVERINFO)
-            continue;
-        offset = i + 1;
-        for (;;) {
+    offset = 1;
+    for (;;) {
+        if (offset + 4 > length)
+            return 0;
+        value = nq_read_le32(message + offset);
+        offset += 4;
+        if (value == NQ_PROTOCOL_FTE_PEXT1 || value == NQ_PROTOCOL_FTE_PEXT2) {
             if (offset + 4 > length)
-                break;
-            value = nq_read_le32(message + offset);
+                return 0;
+            if (value == NQ_PROTOCOL_FTE_PEXT2)
+                candidate_pext2 = nq_read_le32(message + offset);
             offset += 4;
-            if (value == NQ_PROTOCOL_FTE_PEXT1 || value == NQ_PROTOCOL_FTE_PEXT2) {
-                if (offset + 4 > length)
-                    break;
-                if (value == NQ_PROTOCOL_FTE_PEXT2)
-                    candidate_pext2 = nq_read_le32(message + offset);
-                offset += 4;
-                continue;
-            }
-            if (!nq_supported_protocol((int)value))
-                break;
-            if (value == NQ_PROTOCOL_RMQ) {
-                if (offset + 4 > length)
-                    break;
-                if (protocol_flags)
-                    *protocol_flags = nq_read_le32(message + offset);
-            }
-            if (pext2_flags)
-                *pext2_flags = candidate_pext2;
-            return (int)value;
+            continue;
         }
+        if (!nq_supported_protocol((int)value))
+            return 0;
+        if (value == NQ_PROTOCOL_RMQ) {
+            if (offset + 4 > length)
+                return 0;
+            if (protocol_flags)
+                *protocol_flags = nq_read_le32(message + offset);
+        }
+        if (pext2_flags)
+            *pext2_flags = candidate_pext2;
+        return (int)value;
     }
-    return 0;
 }

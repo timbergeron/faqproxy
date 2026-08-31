@@ -8,6 +8,7 @@ import os
 import pathlib
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -63,7 +64,10 @@ def connect_request(proquake: bool = False) -> bytes:
 
 
 def movement_message(case: ProtocolCase, angles: tuple[float, float, float]) -> bytes:
-    payload = bytearray([3])
+    payload = bytearray()
+    if case.predinfo:
+        payload += bytes([50]) + struct.pack("<I", 1234)
+    payload += bytes([3])
     if case.predinfo:
         payload += struct.pack("<Hf", 7, 1.25)
     else:
@@ -138,6 +142,8 @@ def exercise_protocol(
     server_unreliable = connected(NETFLAG_UNRELIABLE, 0, marker)
     game_server.sendto(server_unreliable, upstream)
     assert receive(client)[0] == server_unreliable
+    game_server.sendto(server_unreliable, upstream)
+    assert receive(client)[0] == server_unreliable
     client.close()
     game_server.close()
     return marker, expected_angles
@@ -164,13 +170,16 @@ def verify_demos(
 ) -> None:
     demos = sorted(record_dir.glob("*.dem"))
     recorded: dict[bytes, tuple[float, float, float]] = {}
+    record_counts: dict[bytes, int] = {}
     for demo in demos:
         for angles, payload in demo_records(demo):
             recorded[payload] = angles
+            record_counts[payload] = record_counts.get(payload, 0) + 1
     for marker, expected_angles in expected:
         actual_angles = recorded[marker]
         for actual, wanted in zip(actual_angles, expected_angles):
             assert abs(actual - wanted) < 0.01, (marker, actual_angles, expected_angles)
+        assert record_counts[marker] == 1, (marker, record_counts[marker])
 
 
 def verify_reconnect(proxy_port: int, control_server: socket.socket) -> None:
@@ -215,13 +224,28 @@ def verify_control_query(proxy_port: int, control_server: socket.socket) -> None
     client.bind(("127.0.0.1", 0))
     client.settimeout(3)
     request = control(0x02, b"QUAKE\x00\x03")
-    response = control(0x83, b"mock server\x00")
+    response = control(0x83, b"192.0.2.10:26000\x00mock server\x00")
 
     client.sendto(request, ("127.0.0.1", proxy_port))
     forwarded, upstream = receive(control_server)
     assert forwarded == request
     control_server.sendto(response, upstream)
-    assert receive(client)[0] == response
+    rewritten = receive(client)[0]
+    assert rewritten[4] == 0x83
+    assert rewritten[5:].split(b"\x00", 1)[0] == f"127.0.0.1:{proxy_port}".encode()
+
+    control_server.sendto(response, upstream)
+    client.settimeout(0.2)
+    try:
+        receive(client)
+        raise AssertionError("query session relayed more than one response")
+    except socket.timeout:
+        pass
+    finally:
+        client.settimeout(3)
+
+    client.sendto(control(0x03, b"\x00"), ("127.0.0.1", proxy_port))
+    client.sendto(control(0x05, b"password\x00status\x00"), ("127.0.0.1", proxy_port))
 
     client.sendto(control(0x80, b"ignored"), ("127.0.0.1", proxy_port))
     control_server.settimeout(0.2)
@@ -246,7 +270,7 @@ def main() -> None:
     proxy_port = free_udp_port()
 
     with tempfile.TemporaryDirectory(prefix="faqproxy-test-") as temp:
-        record_dir = pathlib.Path(temp) / "demos"
+        record_dir = pathlib.Path(temp) / "private" / "nested" / "demos"
         process = subprocess.Popen(
             [
                 str(arguments.binary.resolve()),
@@ -287,6 +311,8 @@ def main() -> None:
         for protocol in (15, 666, 999):
             assert f"protocol {protocol}" in stderr, stderr
         verify_demos(record_dir, expected)
+        if os.name != "nt":
+            assert stat.S_IMODE(record_dir.stat().st_mode) == 0o700
 
     server.close()
     print("extended end-to-end protocols 15, 666, and 999 passed")

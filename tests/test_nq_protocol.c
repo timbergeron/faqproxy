@@ -94,11 +94,21 @@ static void test_packet_view(void)
 
     nq_write_be32(packet, NQ_NETFLAG_CTL | NQ_NETFLAG_DATA | sizeof(packet));
     assert(!nq_parse_packet(packet, sizeof(packet), &view));
+
+    nq_write_be32(packet, NQ_NETFLAG_DATA | NQ_NETFLAG_ACK | sizeof(packet));
+    assert(!nq_parse_packet(packet, sizeof(packet), &view));
+    nq_write_be32(packet, NQ_NETFLAG_ACK | NQ_NETFLAG_EOM | sizeof(packet));
+    assert(!nq_parse_packet(packet, sizeof(packet), &view));
+    nq_write_be32(packet, NQ_NETFLAG_ACK | sizeof(packet));
+    assert(!nq_parse_packet(packet, sizeof(packet), &view));
+    nq_write_be32(packet, NQ_NETFLAG_ACK | 8);
+    assert(nq_parse_packet(packet, 8, &view));
 }
 
 static void test_protocol_detection(void)
 {
     uint8_t message[32] = {NQ_SVC_SERVERINFO};
+    uint8_t false_positive[8] = {1, 2, NQ_SVC_SERVERINFO};
     uint32_t flags = 0;
     uint32_t pext2 = 0;
 
@@ -120,6 +130,44 @@ static void test_protocol_detection(void)
     nq_write_le32(message + 9, NQ_PROTOCOL_FITZQUAKE);
     assert(nq_find_server_protocol(message, 13, &flags, &pext2) == NQ_PROTOCOL_FITZQUAKE);
     assert(pext2 == (NQ_PEXT2_PREDINFO | NQ_PEXT2_PRYDONCURSOR));
+
+    nq_write_le32(false_positive + 3, NQ_PROTOCOL_NETQUAKE);
+    assert(nq_find_server_protocol(false_positive, 7, &flags, &pext2) == 0);
+}
+
+static uint32_t fuzz_next(uint32_t *state)
+{
+    uint32_t value = *state;
+
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    *state = value;
+    return value;
+}
+
+static void test_parser_smoke_fuzz(void)
+{
+    uint8_t input[512];
+    uint8_t output[768];
+    uint32_t state = UINT32_C(0x5eed1234);
+    size_t iteration;
+
+    for (iteration = 0; iteration < 20000; ++iteration) {
+        nq_packet_view view;
+        uint32_t protocol_flags;
+        uint32_t pext2_flags;
+        bool proquake;
+        size_t length = fuzz_next(&state) % (sizeof(input) + 1);
+        size_t i;
+
+        for (i = 0; i < length; ++i)
+            input[i] = (uint8_t)fuzz_next(&state);
+        (void)nq_parse_packet(input, length, &view);
+        (void)nq_is_connect_request(input, length, &proquake);
+        (void)nq_rewrite_accept(output, sizeof(output), input, length, 26000);
+        (void)nq_find_server_protocol(input, length, &protocol_flags, &pext2_flags);
+    }
 }
 
 int main(void)
@@ -129,6 +177,7 @@ int main(void)
     test_reject();
     test_packet_view();
     test_protocol_detection();
+    test_parser_smoke_fuzz();
     puts("nq protocol tests passed");
     return 0;
 }

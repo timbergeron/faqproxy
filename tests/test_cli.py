@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -30,6 +31,7 @@ def main() -> None:
 
     result = run(binary, "--help")
     assert result.returncode == 0 and "protocols 15, 666, and 999" in result.stdout, result
+    assert "--allow-rcon" in result.stdout and "--connect-rate" in result.stdout, result
 
     result = run(binary, "-vv", "--help")
     assert result.returncode == 0, result
@@ -43,6 +45,12 @@ def main() -> None:
         ("--max-clients=65", "127.0.0.1:26000"),
         ("--max-clients", "65", "127.0.0.1:26000"),
         ("--timeout", "86401", "127.0.0.1:26000"),
+        ("--timeout=", "127.0.0.1:26000"),
+        ("--max-demo-mib", "1048577", "127.0.0.1:26000"),
+        ("--query-rate", "10001", "127.0.0.1:26000"),
+        ("--connect-rate", "10001", "127.0.0.1:26000"),
+        ("--record-dir=", "127.0.0.1:26000"),
+        ("--advertise", ":26000", "127.0.0.1:26000"),
         ("--listen", "127.0.0.1:bad", "127.0.0.1:26000"),
         (":26000",),
     ]
@@ -59,6 +67,17 @@ def main() -> None:
         )
         assert result.returncode == 2, result
         assert "Cannot create or use record directory" in result.stderr, result.stderr
+
+    if os.name != "nt":
+        with tempfile.TemporaryDirectory(prefix="faqproxy-cli-") as temp:
+            root = pathlib.Path(temp)
+            real_directory = root / "real"
+            real_directory.mkdir()
+            link = root / "record-link"
+            link.symlink_to(real_directory, target_is_directory=True)
+            result = run(binary, "--record-dir", str(link), "127.0.0.1:26000")
+            assert result.returncode == 2, result
+            assert "Cannot create or use record directory" in result.stderr, result.stderr
 
     print("command-line validation passed")
 

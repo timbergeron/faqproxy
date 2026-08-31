@@ -10,7 +10,7 @@ This repository is an independent implementation. It is not the historical FAQPr
 
 ## Historical credit
 
-The original FAQProxy was created in 1997 by Juha “Perkele” Kujala and Ilkka “Zibbo” Rajala of the Finnish Allied Quakers (FAQ) clan. Their protocol-aware NetQuake proxy pioneered external demo recording, spectator and chase-camera experiments, teamplay tools, and programmable network routing without requiring changes to the client or server. Their work later evolved into Qizmo and helped establish the idea of a game-aware proxy as an extension platform.
+The original FAQProxy was created in 1997 by Juha “Perkele” Kujala and Ilkka “Zibbo” Rajala of the Finnish Allied Quakers (FAQ) clan. Their protocol-aware NetQuake proxy pioneered external demo recording, spectator and chase-camera experiments, teamplay tools, and programmable network routing without requiring changes to the client or server. The Qizmo 2.91 manual identifies Qizmo as based on FAQProxy 1.02 and backward compatible with it; that work later led toward QTV and helped establish the game-aware proxy as an extension platform.
 
 This project is named in recognition of that work. All credit for the original FAQProxy concept, design, and historical implementation belongs to Perkele, Zibbo, and the original FAQProxy contributors. The code in this repository is a new implementation based on publicly understood NetQuake protocol behavior and modern engine references.
 
@@ -21,7 +21,8 @@ This project is named in recognition of that work. All credit for the original F
 - NetQuake's reliable, fragmented, acknowledged stream and unreliable datagrams
 - ProQuake handshake extensions and 16-bit client-angle negotiation
 - Multiple simultaneous clients, each with an isolated upstream UDP socket
-- Server-browser, player-info, rule-info, and RCON control-packet forwarding to one fixed server
+- Server-browser and rule-info forwarding to one fixed server, with player-info and RCON available only through explicit opt-in flags
+- Server-info address rewriting so browsers connect back through the proxy rather than learning the backend address
 - Protocol detection from reassembled `svc_serverinfo` messages, including FTE extension preambles
 - First-person NetQuake `.dem` recording with protocol-aware view-angle extraction
 - Native Windows, Linux, and macOS builds with no third-party runtime libraries
@@ -55,7 +56,7 @@ make
 make test
 ```
 
-The binary is `build/faqproxy`. The tests start a mock NetQuake server and client and exercise redirected game ports, reliable fragment acknowledgements, unreliable traffic, reconnects, ProQuake negotiation, FTE2 prediction framing, and demo view angles across protocols 15, 666, and 999.
+The binary is `build/faqproxy`. The tests start a mock NetQuake server and client and exercise redirected game ports, reliable fragment acknowledgements, unreliable traffic, reconnects, ProQuake negotiation, FTE2 prediction framing, and demo view angles across protocols 15, 666, and 999. They also cover malformed-packet rejection, reflection and query limits, unconfirmed-session budgets, privileged query defaults, recording-path safety, and a deterministic parser stress corpus.
 
 GitHub Actions runs the same build and tests on Windows, Linux, and macOS for every push to `main` and every pull request. Successful runs retain downloadable `faqproxy-windows-x86_64`, `faqproxy-linux`, and `faqproxy-macos` binaries for 14 days. The Linux job also runs the sanitizer test target.
 
@@ -95,6 +96,16 @@ connect 127.0.0.1:26000
 
 Use `-v` for additional diagnostics and `-vv` for one line per forwarded datagram. Run `./build/faqproxy --help` for all options.
 
+When listening on a wildcard address, add the public address that server-browser replies should advertise:
+
+```sh
+./build/faqproxy --listen 0.0.0.0:26000 \
+  --advertise your.vps.address:26000 \
+  quake.example.net:26000
+```
+
+A concrete listener such as `127.0.0.1:26000` is advertised automatically. On a wildcard listener, server-info queries remain disabled until `--advertise` is supplied so the upstream address is never exposed accidentally.
+
 ## Run it on a VPS
 
 On the VPS, build or copy the binary and select one fixed upstream NetQuake server:
@@ -102,6 +113,7 @@ On the VPS, build or copy the binary and select one fixed upstream NetQuake serv
 ```sh
 ./faqproxy \
   --listen 0.0.0.0:26000 \
+  --advertise your.vps.address:26000 \
   --record-dir ./demos \
   quake.example.net:26000
 ```
@@ -112,15 +124,17 @@ Allow inbound UDP port 26000 in both the VPS provider firewall and the host fire
 connect your.vps.address:26000
 ```
 
-Only the configured upstream server can be reached through the process, so this is not an open UDP relay. It does not provide authentication, encryption, or source-address validation, however. NetQuake predates modern challenge handshakes: anyone who can reach the listen port can attempt to occupy a server slot, reflect replies toward a spoofed UDP source, or use an RCON endpoint exposed by the upstream server. Use a host/provider firewall to restrict the source networks when the proxy is not intended to be public, keep `--max-clients` bounded, and use a strong upstream RCON password.
+Only the configured upstream server can be reached through the process, so this is not an open UDP relay. New connections are globally limited to 16 per second with a two-second burst; handshake retransmits do not consume that budget. Query packets are length-checked, limited to one quarter of the session pool (at most 16), globally rate-limited to 32 per second with a two-second burst, and closed after one response. `--connect-rate` and `--query-rate` adjust those ceilings. Server traffic never refreshes client-idle timeouts, and a connection that never ACKs a reliable packet relayed from the server is closed after at most five seconds and 256 KiB of server traffic. Malformed five-byte connects are dropped without an amplified rejection, while the remaining rejection path is globally rate-limited. Upstream UDP sockets are kernel-connected so off-path datagrams are discarded.
 
-[`docs/faqproxy.service`](docs/faqproxy.service) is a hardened systemd starting point. It expects the binary installed at `/usr/local/bin/faqproxy` and a dedicated `faqproxy` system user. Replace the upstream hostname and port, then validate the unit with `systemd-analyze verify` before enabling it.
+NetQuake still provides no authentication, encryption, or cryptographic source validation. Anyone who can reach the listener can send a syntactically valid spoofed connection request or try to occupy real server slots. Use host/provider firewall rules when the proxy is not intended to be public and keep `--max-clients` bounded. Player-info queries are disabled by default because some servers include player addresses. Plaintext RCON is also disabled by default because relaying it bypasses upstream source-IP restrictions; `--allow-player-info` and `--allow-rcon` are deliberate compatibility opt-ins.
+
+[`docs/faqproxy.service`](docs/faqproxy.service) is a hardened systemd starting point with syscall, memory, task, IPC, file-permission, and restart-loop limits. It expects the binary installed at `/usr/local/bin/faqproxy` and a dedicated `faqproxy` system user. Replace both example hostnames, then validate the unit with `systemd-analyze verify` before enabling it. Its `UMask=0077` makes service-recorded demos owner-only even though standalone Unix runs create them with a maximum mode of `0640`.
 
 ## Demo recording notes
 
 Recorded files use the standard NetQuake demo layout and retain the server's native 15, 666, or 999 messages. QSS-M, Quakespasm-family clients, and JoeQuake builds that support the recorded protocol can play them.
 
-The recorder follows the connected player's point of view. It reads client movement angles as 8-bit protocol-15 angles, negotiated ProQuake angles, FTE2 prediction angles, 16-bit protocol-666 angles, or the angle mode selected by protocol-999 flags. Demo files are created exclusively and an existing path is never overwritten. Unix builds use mode `0640`; Windows files inherit the recording directory's access-control list. Packet forwarding does not depend on recording, so a recording error stops that demo but leaves the game connected.
+The recorder follows the connected player's point of view. It reads client movement angles as 8-bit protocol-15 angles, negotiated ProQuake angles, FTE2 prediction angles (including replacement-delta ACK prefixes), 16-bit protocol-666 angles, or the angle mode selected by protocol-999 flags. Stale unreliable datagrams that a real client would discard are not duplicated in the demo. Demo files are created exclusively and an existing path is never overwritten. Newly created Unix recording directories use mode `0700`, symlinked directory components are rejected, demos use `0640`, and Windows files inherit the directory's access-control list. Each demo is capped at 1024 MiB by default; use `--max-demo-mib` to change the cap or set it to `0` deliberately for no limit. A recording error or limit stops that demo but leaves the game connected.
 
 ## Current boundaries
 
@@ -130,12 +144,14 @@ The recorder follows the connected player's point of view. It reads client movem
 - The inspector recognizes only protocols 15, 666, and 999. Relay traffic is never rewritten to fake compatibility with an unsupported client.
 - FAQProxy is a user-space relay, so the route adds the client-to-VPS and VPS-to-server network legs.
 - NetQuake has no cryptographic connection challenge; firewall policy remains the primary protection for a private deployment.
+- Connection and query rate limits can be tuned with `--connect-rate` and `--query-rate`; `0` deliberately disables either one. Use an external firewall rate limit as well on an exposed high-traffic deployment.
+- ProQuake cheat-free mode is rejected with a clear error: its port-keyed encoding cannot survive a UDP relay safely. ProQuake angle negotiation remains supported. `PQF_IGNOREPORT` is the later single-port extension, not an original ProQuake cheat-free flag.
 
 The next sensible historical features are capture metadata and demo controls, followed by an optional spectator/chasecam state layer. Network simulation and tunneling can remain separate modules so the native relay stays auditable.
 
 ## Source references
 
-The wire definitions were checked against the local QSS-M and JoeQuake sources, including their `protocol.h`, `net_defs.h`, `net_dgrm.c`, `cl_parse.c`, `cl_input.c`, and `cl_demo.c` implementations. FAQProxy's code is newly written and intentionally small; it does not link to either engine.
+The historical relationship was checked against the unmodified Qizmo 2.91 manual. Wire definitions and behavior were checked against QSS-M, JoeQuake, Qrack/ProQuake-derived code, and the neighboring `nq666-proxy`, including `protocol.h`, `net_defs.h`, `net_dgrm.c`, `cl_parse.c`, `cl_input.c`, and `cl_demo.c`. FAQProxy's code is newly written and intentionally small; it does not link to those engines or proxies.
 
 ## License
 

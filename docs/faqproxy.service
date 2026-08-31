@@ -2,6 +2,8 @@
 Description=FAQProxy NetQuake relay
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,11 +12,16 @@ Group=faqproxy
 WorkingDirectory=/var/lib/faqproxy
 StateDirectory=faqproxy
 StateDirectoryMode=0750
-ExecStart=/usr/local/bin/faqproxy --listen 0.0.0.0:26000 --record-dir /var/lib/faqproxy/demos quake.example.net:26000
+ExecStart=/usr/local/bin/faqproxy --listen 0.0.0.0:26000 --advertise proxy.example.net:26000 --record-dir /var/lib/faqproxy/demos quake.example.net:26000
 Restart=on-failure
+RestartPreventExitStatus=2
 RestartSec=2
-UMask=0027
+TimeoutStopSec=15
+UMask=0077
 LimitNOFILE=256
+MemoryMax=64M
+TasksMax=16
+RemoveIPC=true
 NoNewPrivileges=true
 CapabilityBoundingSet=
 LockPersonality=true
@@ -35,6 +42,8 @@ RestrictAddressFamilies=AF_INET AF_UNIX
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 SystemCallArchitectures=native
 
 [Install]

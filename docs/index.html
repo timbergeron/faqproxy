@@ -958,6 +958,7 @@ make test</code></pre>
               <button class="copy-button" type="button" data-copy aria-label="Copy proxy command">Copy</button>
               <pre><code>./build/faqproxy \
   --listen 0.0.0.0:26000 \
+  --advertise your.vps.address:26000 \
   quake.example.net:26000</code></pre>
             </div>
             <div class="code-block">
@@ -1101,7 +1102,11 @@ make test</code></pre>
           <dl class="option-list">
             <div class="option-row">
               <dt>-l, --listen</dt>
-              <dd>Local IPv4 address and UDP port. Default: <code>0.0.0.0:26000</code>.</dd>
+              <dd>Local IPv4 address and UDP port. Port <code>0</code> selects an ephemeral port. Default: <code>0.0.0.0:26000</code>.</dd>
+            </div>
+            <div class="option-row">
+              <dt>-a, --advertise</dt>
+              <dd>Public address placed in server-browser replies. Required for server-info queries on a wildcard listener.</dd>
             </div>
             <div class="option-row">
               <dt>-r, --record-dir</dt>
@@ -1113,7 +1118,27 @@ make test</code></pre>
             </div>
             <div class="option-row">
               <dt>-t, --timeout</dt>
-              <dd>Established-session idle timeout from 0 to 86,400 seconds. Default: 120.</dd>
+              <dd>Client-direction idle timeout from 0 to 86,400 seconds. Zero deliberately disables it. Default: 120.</dd>
+            </div>
+            <div class="option-row">
+              <dt>--connect-rate</dt>
+              <dd>Global new-connection rate per second with a two-second burst. Handshake retries do not consume it. Zero deliberately disables the limit. Default: 16.</dd>
+            </div>
+            <div class="option-row">
+              <dt>--query-rate</dt>
+              <dd>Global control-query rate per second with a two-second burst. Zero deliberately disables it. Default: 32.</dd>
+            </div>
+            <div class="option-row">
+              <dt>--max-demo-mib</dt>
+              <dd>Maximum size of each demo in MiB. Zero deliberately disables the cap. Default: 1024.</dd>
+            </div>
+            <div class="option-row">
+              <dt>--allow-player-info</dt>
+              <dd>Relay optional player queries, which can expose player addresses on older upstream servers.</dd>
+            </div>
+            <div class="option-row">
+              <dt>--allow-rcon</dt>
+              <dd>Relay plaintext RCON and bypass upstream source-IP restrictions. Disabled by default.</dd>
             </div>
             <div class="option-row">
               <dt>-v, -vv</dt>
@@ -1131,7 +1156,8 @@ make test</code></pre>
             <p>Recordings retain the server's original 15, 666, or 999 messages and follow the connected player's view.</p>
             <ul>
               <li>Existing paths are never overwritten.</li>
-              <li>Unix files use mode <code>0640</code>.</li>
+              <li>New Unix directories use <code>0700</code>, symlinked components are rejected, and files use at most <code>0640</code>; the service unit tightens them to <code>0600</code>.</li>
+              <li>Each demo is capped at 1024 MiB by default.</li>
               <li>Recording failure never stops packet forwarding.</li>
               <li>Play back in an engine that supports the recorded protocol.</li>
             </ul>
@@ -1150,8 +1176,11 @@ make test</code></pre>
           </div>
           <ul class="security-list">
             <li>There is no authentication, encryption, or cryptographic source validation.</li>
-            <li>A reachable listener can be used to attempt slot exhaustion or UDP reflection.</li>
-            <li>RCON requests can reach the configured upstream server; use a strong password.</li>
+            <li>New connections and validated queries have separate global rate limits; queries are also session-capped and closed after one response.</li>
+            <li>Only client traffic refreshes idle timeouts; server retransmits cannot hold a spoofed session open.</li>
+            <li>Unconfirmed connections have a separate five-second and 256 KiB server-traffic ceiling.</li>
+            <li>Server-info replies advertise the proxy and never disclose the fixed backend address.</li>
+            <li>Player-info and plaintext RCON forwarding require explicit compatibility flags.</li>
             <li>Use host and provider firewalls when the proxy is not intended to be public.</li>
             <li>Keep <code>--max-clients</code> bounded and monitor service logs.</li>
           </ul>
@@ -1163,7 +1192,7 @@ make test</code></pre>
       <div class="history shell">
         <blockquote>Built in recognition of the tool that showed a proxy could become part of the game.</blockquote>
         <div class="history-copy">
-          <p>The original FAQProxy was created in 1997 by Juha “Perkele” Kujala and Ilkka “Zibbo” Rajala of the Finnish Allied Quakers clan. It pioneered external demo recording, spectator and chase-camera experiments, teamplay tools, and programmable routing. That work later evolved into Qizmo.</p>
+          <p>The original FAQProxy was created in 1997 by Juha “Perkele” Kujala and Ilkka “Zibbo” Rajala of the Finnish Allied Quakers clan. It pioneered external demo recording, spectator and chase-camera experiments, teamplay tools, and programmable routing. The Qizmo 2.91 manual describes Qizmo as based on FAQProxy 1.02 and backward compatible with it.</p>
           <p>This repository is a new, independent implementation. All credit for the original FAQProxy concept and historical implementation belongs to Perkele, Zibbo, and its original contributors.</p>
           <p><a href="https://github.com/timbergeron/faqproxy#historical-credit">Read the full project notes on GitHub →</a></p>
         </div>
